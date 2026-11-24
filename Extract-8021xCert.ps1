@@ -238,6 +238,66 @@ public static class PfxBuilder
 }
 "@ -ErrorAction SilentlyContinue
 
+# --- Helper: resolve private key container info from cert ---
+# Tries .NET APIs first, falls back to certutil (language-independent regex)
+function Get-PrivateKeyInfo {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
+        [string]$StoreLocation = "LocalMachine"
+    )
+
+    $info = @{ KeyName = $null; UniqueName = $null; Provider = $null }
+
+    # Try 1: GetRSAPrivateKey extension method
+    try {
+        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
+        if ($rsa) {
+            $tn = $rsa.GetType().Name
+            if ($tn -eq "RSACng") {
+                try { $info.KeyName = $rsa.Key.KeyName; $info.UniqueName = $rsa.Key.UniqueName; $info.Provider = $rsa.Key.Provider.Provider } catch {}
+            }
+            elseif ($tn -eq "RSACryptoServiceProvider") {
+                try { $ci = $rsa.CspKeyContainerInfo; $info.KeyName = $ci.KeyContainerName; $info.UniqueName = $ci.UniqueKeyContainerName; $info.Provider = $ci.ProviderName } catch {}
+            }
+        }
+    } catch {}
+
+    if ($info.KeyName) { return $info }
+
+    # Try 2: .PrivateKey property (CAPI)
+    try {
+        $pk = $Cert.PrivateKey
+        if ($pk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+            $ci = $pk.CspKeyContainerInfo
+            $info.KeyName = $ci.KeyContainerName
+            $info.UniqueName = $ci.UniqueKeyContainerName
+            $info.Provider = $ci.ProviderName
+        }
+    } catch {}
+
+    if ($info.KeyName) { return $info }
+
+    # Try 3: certutil (works regardless of ACLs, language-independent patterns)
+    try {
+        $certutilOut = & certutil -v -store My $Cert.Thumbprint 2>&1 | Out-String
+
+        # Key container name (EN: "Key Container", FR: "Conteneur de cl...")
+        if ($certutilOut -match '(?:Key Container|Conteneur de cl[^\r\n]*?)[=:]\s*(.+)') {
+            $info.KeyName = $Matches[1].Trim()
+        }
+        # Unique container name (EN: "Unique container name", FR: "Nom unique du conteneur")
+        if ($certutilOut -match '(?:Unique container name|Nom unique du conteneur)[^=:\r\n]*[=:]\s*(.+)') {
+            $info.UniqueName = $Matches[1].Trim()
+        }
+        # Provider (EN: "Provider", FR: "Fournisseur")
+        if ($certutilOut -match '(?:Provider = |Fournisseur = )(.+)') {
+            $info.Provider = $Matches[1].Trim()
+        }
+    } catch {}
+
+    return $info
+}
+
 function Write-Banner {
     Write-Host ""
     Write-Host "=============================================" -ForegroundColor Cyan
@@ -436,41 +496,9 @@ function Export-Method2-PatchCNG {
     $hKey = [IntPtr]::Zero
 
     try {
-        $keyName = $null
-        $providerName = $null
-
-        $rsaKey = $null
-        try {
-            $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
-        } catch {}
-
-        if ($rsaKey) {
-            $typeName = $rsaKey.GetType().Name
-            if ($typeName -eq "RSACng") {
-                try {
-                    $keyName = $rsaKey.Key.KeyName
-                    $providerName = $rsaKey.Key.Provider.Provider
-                } catch {}
-            }
-            elseif ($typeName -eq "RSACryptoServiceProvider") {
-                try {
-                    $cspInfo = $rsaKey.CspKeyContainerInfo
-                    $keyName = $cspInfo.KeyContainerName
-                    $providerName = $cspInfo.ProviderName
-                } catch {}
-            }
-        }
-
-        if (-not $keyName) {
-            try {
-                $pk = $Cert.PrivateKey
-                if ($pk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-                    $cspInfo = $pk.CspKeyContainerInfo
-                    $keyName = $cspInfo.KeyContainerName
-                    $providerName = $cspInfo.ProviderName
-                }
-            } catch {}
-        }
+        $pkInfo = Get-PrivateKeyInfo -Cert $Cert
+        $keyName = $pkInfo.KeyName
+        $providerName = $pkInfo.Provider
 
         if ($keyName -and (-not $providerName -or $providerName -match "Cryptographic Provider")) {
             $providerName = "Microsoft Software Key Storage Provider"
@@ -590,125 +618,57 @@ function Export-Method3-DPAPIKeyFile {
     Write-Host "[*] Method 3: Raw CNG key file + DPAPI LocalMachine decrypt..." -ForegroundColor Yellow
 
     try {
-        $keyUniqueName = $null
-        $keyName = $null
+        $pkInfo = Get-PrivateKeyInfo -Cert $Cert
+        $keyUniqueName = $pkInfo.UniqueName
+        $keyName = $pkInfo.KeyName
 
-        $rsaKey = $null
-        try {
-            $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
-        } catch {}
-
-        if ($rsaKey) {
-            $typeName = $rsaKey.GetType().Name
-            if ($typeName -eq "RSACng") {
-                try {
-                    $keyUniqueName = $rsaKey.Key.UniqueName
-                    $keyName = $rsaKey.Key.KeyName
-                } catch {}
-            }
-            elseif ($typeName -eq "RSACryptoServiceProvider") {
-                try {
-                    $cspInfo = $rsaKey.CspKeyContainerInfo
-                    $keyUniqueName = $cspInfo.UniqueKeyContainerName
-                    $keyName = $cspInfo.KeyContainerName
-                } catch {}
-            }
-        }
-
-        if (-not $keyUniqueName) {
-            try {
-                $pk = $Cert.PrivateKey
-                if ($pk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-                    $cspInfo = $pk.CspKeyContainerInfo
-                    $keyUniqueName = $cspInfo.UniqueKeyContainerName
-                    $keyName = $cspInfo.KeyContainerName
-                }
-            } catch {}
-        }
-
-        # Fallback: reopen fresh from LocalMachine store
-        if (-not $keyUniqueName) {
-            try {
-                $store = New-Object System.Security.Cryptography.X509Certificates.X509Store(
-                    "My", [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
-                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -bor
-                    [System.Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly)
-                $found = $store.Certificates | Where-Object { $_.Thumbprint -eq $Cert.Thumbprint }
-                if ($found) {
-                    $freshCert = $found[0]
-                    $freshRsa = $null
-                    try {
-                        $freshRsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($freshCert)
-                    } catch {}
-                    if ($freshRsa) {
-                        $tn = $freshRsa.GetType().Name
-                        if ($tn -eq "RSACng") {
-                            try { $keyUniqueName = $freshRsa.Key.UniqueName; $keyName = $freshRsa.Key.KeyName } catch {}
-                        }
-                        elseif ($tn -eq "RSACryptoServiceProvider") {
-                            try {
-                                $ci = $freshRsa.CspKeyContainerInfo
-                                $keyUniqueName = $ci.UniqueKeyContainerName
-                                $keyName = $ci.KeyContainerName
-                            } catch {}
-                        }
-                    }
-                    if (-not $keyUniqueName) {
-                        try {
-                            $fpk = $freshCert.PrivateKey
-                            if ($fpk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-                                $ci = $fpk.CspKeyContainerInfo
-                                $keyUniqueName = $ci.UniqueKeyContainerName
-                                $keyName = $ci.KeyContainerName
-                            }
-                        } catch {}
-                    }
-                }
-                $store.Close()
-            }
-            catch {}
-        }
-
-        if (-not $keyUniqueName) {
-            Write-Host "[-] Method 3 failed: could not determine key unique name." -ForegroundColor DarkYellow
+        if (-not $keyUniqueName -and -not $keyName) {
+            Write-Host "[-] Method 3 failed: could not determine key name." -ForegroundColor DarkYellow
             return $false
         }
 
-        Write-Host "[*] Key unique name: $keyUniqueName" -ForegroundColor Gray
+        Write-Host "[*] Key name: $keyName" -ForegroundColor Gray
+        if ($keyUniqueName) { Write-Host "[*] Unique name: $keyUniqueName" -ForegroundColor Gray }
 
-        # Key file search paths: machine keys + current user keys (CAPI and CNG)
         $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-        $cngKeyPaths = @(
-            "$env:ProgramData\Microsoft\Crypto\Keys\$keyUniqueName",
-            "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys\$keyUniqueName",
-            "$env:ProgramData\Microsoft\Crypto\SystemKeys\$keyUniqueName",
-            "$env:APPDATA\Microsoft\Crypto\Keys\$keyUniqueName",
-            "$env:APPDATA\Microsoft\Crypto\RSA\$sid\$keyUniqueName"
+        $searchDirs = @(
+            "$env:ProgramData\Microsoft\Crypto\Keys",
+            "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys",
+            "$env:ProgramData\Microsoft\Crypto\SystemKeys",
+            "$env:APPDATA\Microsoft\Crypto\Keys",
+            "$env:APPDATA\Microsoft\Crypto\RSA\$sid"
         )
 
         $keyFilePath = $null
-        foreach ($p in $cngKeyPaths) {
-            if (Test-Path $p) {
-                $keyFilePath = $p
-                break
+
+        # Try direct path with unique name first
+        if ($keyUniqueName) {
+            foreach ($dir in $searchDirs) {
+                $p = Join-Path $dir $keyUniqueName
+                if (Test-Path $p) { $keyFilePath = $p; break }
             }
         }
 
-        if (-not $keyFilePath) {
-            $searchPaths = @(
-                "$env:ProgramData\Microsoft\Crypto\Keys",
-                "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys",
-                "$env:ProgramData\Microsoft\Crypto\SystemKeys",
-                "$env:APPDATA\Microsoft\Crypto\Keys",
-                "$env:APPDATA\Microsoft\Crypto\RSA\$sid"
-            )
-            foreach ($dir in $searchPaths) {
+        # Fallback: search by key name pattern in all dirs
+        if (-not $keyFilePath -and $keyName) {
+            foreach ($dir in $searchDirs) {
                 if (Test-Path $dir) {
-                    $found = Get-ChildItem -Path $dir -Filter "*$keyName*" -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($found) {
-                        $keyFilePath = $found.FullName
-                        break
-                    }
+                    $found = Get-ChildItem -Path $dir -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match [regex]::Escape($keyName) } |
+                        Select-Object -First 1
+                    if ($found) { $keyFilePath = $found.FullName; break }
+                }
+            }
+        }
+
+        # Last resort: search by unique name pattern
+        if (-not $keyFilePath -and $keyUniqueName) {
+            foreach ($dir in $searchDirs) {
+                if (Test-Path $dir) {
+                    $found = Get-ChildItem -Path $dir -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match [regex]::Escape($keyUniqueName) } |
+                        Select-Object -First 1
+                    if ($found) { $keyFilePath = $found.FullName; break }
                 }
             }
         }
