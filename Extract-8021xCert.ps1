@@ -291,9 +291,9 @@ function Get-CertificateTemplate {
 
 function Find-8021xCerts {
     Write-Host "[*] Scanning Cert:\LocalMachine\My for 802.1X certificates..." -ForegroundColor Yellow
-    $certs = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue
+    [array]$certs = @(Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue)
 
-    if (-not $certs -or $certs.Count -eq 0) {
+    if ($certs.Count -eq 0) {
         Write-Host "[-] No certificates found in LocalMachine\My store." -ForegroundColor Red
         return $null
     }
@@ -332,21 +332,21 @@ function Find-8021xCerts {
         }
     }
 
-    return $results
+    return ,$results
 }
 
 function Select-Certificate {
     param([array]$CertList)
 
     # Filter for 8021x candidates with private keys
-    $candidates = $CertList | Where-Object { $_.Is8021x -and $_.HasPrivateKey }
+    [array]$candidates = @($CertList | Where-Object { $_.Is8021x -and $_.HasPrivateKey })
 
-    if (-not $candidates -or $candidates.Count -eq 0) {
+    if ($candidates.Count -eq 0) {
         Write-Host "[!] No 802.1X candidates found automatically. Showing all certs with private keys..." -ForegroundColor Yellow
-        $candidates = $CertList | Where-Object { $_.HasPrivateKey }
+        [array]$candidates = @($CertList | Where-Object { $_.HasPrivateKey })
     }
 
-    if (-not $candidates -or $candidates.Count -eq 0) {
+    if ($candidates.Count -eq 0) {
         Write-Host "[-] No certificates with private keys found." -ForegroundColor Red
         return $null
     }
