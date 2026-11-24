@@ -439,31 +439,39 @@ function Export-Method2-PatchCNG {
         $keyName = $null
         $providerName = $null
 
-        # Use static extension method (PS 5.1 compat: instance .GetRSAPrivateKey() does not exist)
         $rsaKey = $null
         try {
             $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
         } catch {}
 
-        if ($rsaKey -and $rsaKey.GetType().Name -eq "RSACng") {
+        if ($rsaKey) {
+            $typeName = $rsaKey.GetType().Name
+            if ($typeName -eq "RSACng") {
+                try {
+                    $keyName = $rsaKey.Key.KeyName
+                    $providerName = $rsaKey.Key.Provider.Provider
+                } catch {}
+            }
+            elseif ($typeName -eq "RSACryptoServiceProvider") {
+                try {
+                    $cspInfo = $rsaKey.CspKeyContainerInfo
+                    $keyName = $cspInfo.KeyContainerName
+                    $providerName = $cspInfo.ProviderName
+                } catch {}
+            }
+        }
+
+        if (-not $keyName) {
             try {
-                $cngKey = $rsaKey.Key
-                $keyName = $cngKey.KeyName
-                $providerName = $cngKey.Provider.Provider
-            }
-            catch {}
+                $pk = $Cert.PrivateKey
+                if ($pk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+                    $cspInfo = $pk.CspKeyContainerInfo
+                    $keyName = $cspInfo.KeyContainerName
+                    $providerName = $cspInfo.ProviderName
+                }
+            } catch {}
         }
 
-        # Fallback: .PrivateKey property (CAPI path)
-        if (-not $keyName -and $Cert.PrivateKey) {
-            if ($Cert.PrivateKey -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-                $cspInfo = $Cert.PrivateKey.CspKeyContainerInfo
-                $keyName = $cspInfo.KeyContainerName
-                $providerName = $cspInfo.ProviderName
-            }
-        }
-
-        # Normalize CAPI provider names to CNG KSP
         if ($keyName -and (-not $providerName -or $providerName -match "Cryptographic Provider")) {
             $providerName = "Microsoft Software Key Storage Provider"
         }
@@ -585,33 +593,40 @@ function Export-Method3-DPAPIKeyFile {
         $keyUniqueName = $null
         $keyName = $null
 
-        # Use static extension method (PS 5.1 compat)
         $rsaKey = $null
         try {
             $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
         } catch {}
 
-        if ($rsaKey -and $rsaKey.GetType().Name -eq "RSACng") {
-            try {
-                $cngKey = $rsaKey.Key
-                $keyUniqueName = $cngKey.UniqueName
-                $keyName = $cngKey.KeyName
+        if ($rsaKey) {
+            $typeName = $rsaKey.GetType().Name
+            if ($typeName -eq "RSACng") {
+                try {
+                    $keyUniqueName = $rsaKey.Key.UniqueName
+                    $keyName = $rsaKey.Key.KeyName
+                } catch {}
             }
-            catch {}
+            elseif ($typeName -eq "RSACryptoServiceProvider") {
+                try {
+                    $cspInfo = $rsaKey.CspKeyContainerInfo
+                    $keyUniqueName = $cspInfo.UniqueKeyContainerName
+                    $keyName = $cspInfo.KeyContainerName
+                } catch {}
+            }
         }
 
-        # Fallback: .PrivateKey property (CAPI)
-        if (-not $keyUniqueName -and $Cert.PrivateKey) {
+        if (-not $keyUniqueName) {
             try {
-                if ($Cert.PrivateKey -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-                    $keyUniqueName = $Cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
-                    $keyName = $Cert.PrivateKey.CspKeyContainerInfo.KeyContainerName
+                $pk = $Cert.PrivateKey
+                if ($pk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+                    $cspInfo = $pk.CspKeyContainerInfo
+                    $keyUniqueName = $cspInfo.UniqueKeyContainerName
+                    $keyName = $cspInfo.KeyContainerName
                 }
-            }
-            catch {}
+            } catch {}
         }
 
-        # Fallback: reopen from cert store to resolve key info
+        # Fallback: reopen fresh from LocalMachine store
         if (-not $keyUniqueName) {
             try {
                 $store = New-Object System.Security.Cryptography.X509Certificates.X509Store(
@@ -625,13 +640,28 @@ function Export-Method3-DPAPIKeyFile {
                     try {
                         $freshRsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($freshCert)
                     } catch {}
-                    if ($freshRsa -and $freshRsa.GetType().Name -eq "RSACng") {
-                        $keyUniqueName = $freshRsa.Key.UniqueName
-                        $keyName = $freshRsa.Key.KeyName
+                    if ($freshRsa) {
+                        $tn = $freshRsa.GetType().Name
+                        if ($tn -eq "RSACng") {
+                            try { $keyUniqueName = $freshRsa.Key.UniqueName; $keyName = $freshRsa.Key.KeyName } catch {}
+                        }
+                        elseif ($tn -eq "RSACryptoServiceProvider") {
+                            try {
+                                $ci = $freshRsa.CspKeyContainerInfo
+                                $keyUniqueName = $ci.UniqueKeyContainerName
+                                $keyName = $ci.KeyContainerName
+                            } catch {}
+                        }
                     }
-                    elseif ($freshCert.PrivateKey -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-                        $keyUniqueName = $freshCert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
-                        $keyName = $freshCert.PrivateKey.CspKeyContainerInfo.KeyContainerName
+                    if (-not $keyUniqueName) {
+                        try {
+                            $fpk = $freshCert.PrivateKey
+                            if ($fpk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+                                $ci = $fpk.CspKeyContainerInfo
+                                $keyUniqueName = $ci.UniqueKeyContainerName
+                                $keyName = $ci.KeyContainerName
+                            }
+                        } catch {}
                     }
                 }
                 $store.Close()
