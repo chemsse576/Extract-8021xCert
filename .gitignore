@@ -1,0 +1,5 @@
+*.pfx
+*.pem
+*.key
+8021x_kali/
+wlan_profiles_tmp/
