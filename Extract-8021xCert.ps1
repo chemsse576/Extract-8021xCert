@@ -775,6 +775,7 @@ Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
 } | ForEach-Object {
     $type = "Other"
     if ($_.InterfaceDescription -match "Wi-?Fi|Wireless|WLAN|802\.11") { $type = "WiFi" }
+    elseif ($_.InterfaceDescription -match "USB|ASIX|AX88|RTL8153|RTL8152|Belkin|TP-?Link|Plugable|Anker|StarTech|UE[0-9]|LAN[0-9]") { $type = "USB" }
     elseif ($_.InterfaceDescription -match "Ethernet|Realtek|Intel.*I[0-9]|Broadcom.*NetXtreme|Killer.*E|Marvell") { $type = "Ethernet" }
     elseif ($_.InterfaceDescription -match "Bluetooth") { $type = "Bluetooth" }
     elseif ($_.InterfaceDescription -match "VPN|Virtual|Hyper-V|vEthernet|TAP-|WireGuard|Fortinet|Cisco AnyConnect") { $type = "Virtual" }
