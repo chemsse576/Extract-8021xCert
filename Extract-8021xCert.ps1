@@ -770,15 +770,27 @@ $identity = "host/$fqdn"
 Write-Host "[+] Machine identity: $identity" -ForegroundColor Green
 
 $macs = @()
-Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
-    $_.InterfaceDescription -notmatch "Wi-?Fi|Wireless|Bluetooth"
+Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+    $_.MacAddress -and $_.MacAddress -ne "00-00-00-00-00-00"
 } | ForEach-Object {
+    $type = "Other"
+    if ($_.InterfaceDescription -match "Wi-?Fi|Wireless|WLAN|802\.11") { $type = "WiFi" }
+    elseif ($_.InterfaceDescription -match "Ethernet|Realtek|Intel.*I[0-9]|Broadcom.*NetXtreme|Killer.*E|Marvell") { $type = "Ethernet" }
+    elseif ($_.InterfaceDescription -match "Bluetooth") { $type = "Bluetooth" }
+    elseif ($_.InterfaceDescription -match "VPN|Virtual|Hyper-V|vEthernet|TAP-|WireGuard|Fortinet|Cisco AnyConnect") { $type = "Virtual" }
     $macs += [PSCustomObject]@{
         Name = $_.Name
         MAC = $_.MacAddress.Replace("-",":").ToLower()
         Status = $_.Status
         Desc = $_.InterfaceDescription
+        Type = $type
     }
+}
+Write-Host "[+] $($macs.Count) interface(s) found:" -ForegroundColor Green
+foreach ($m in $macs) {
+    $col = if ($m.Status -eq "Up") { "Green" } else { "Gray" }
+    $st = if ($m.Status -eq "Up") { "UP" } else { "down" }
+    Write-Host "    [$($m.Type.PadRight(9))] $($m.MAC)  ($st)  $($m.Desc)" -ForegroundColor $col
 }
 
 # =============================================
@@ -804,17 +816,24 @@ network={
 # Generate commands.txt
 $macLines = ""
 if ($macs.Count -gt 0) {
-    $macLines += "# MACs Ethernet de la machine $($env:COMPUTERNAME):`n"
+    $macLines += "# Toutes les MACs de la machine $($env:COMPUTERNAME):`n"
+    $macLines += "# Teste chaque MAC jusqu'a trouver celle acceptee par le switch/RADIUS`n"
+    $macLines += "#`n"
     foreach ($m in $macs) {
-        $st = if ($m.Status -eq "Up") { "(ACTIVE)" } else { "(down)" }
-        $macLines += "#   $($m.MAC)  $st  $($m.Desc)`n"
+        $st = if ($m.Status -eq "Up") { "ACTIVE" } else { "down" }
+        $macLines += "#   [$($m.Type)]  $($m.MAC)  ($st)  $($m.Desc)`n"
     }
-    $macLines += @"
-
-sudo ip link set eth0 down
-sudo ip link set eth0 address $($macs[0].MAC)
-sudo ip link set eth0 up
-"@
+    $macLines += "#`n"
+    $i = 0
+    foreach ($m in $macs) {
+        if ($m.Type -eq "Virtual") { continue }
+        $prefix = if ($i -eq 0) { "" } else { "# " }
+        $macLines += "`n${prefix}sudo ip link set eth0 down"
+        $macLines += "`n${prefix}sudo ip link set eth0 address $($m.MAC)"
+        $macLines += "`n${prefix}sudo ip link set eth0 up"
+        $macLines += "  # $($m.Type) - $($m.Desc)`n"
+        $i++
+    }
 }
 
 $commands = @"
